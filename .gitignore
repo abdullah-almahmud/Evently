@@ -1,0 +1,69 @@
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.pyo
+*.pyd
+.python-version
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+
+# ─── Node / Frontend ──────────────────────────────────────────────────────────
+node_modules/
+dist/
+.next/
+out/
+.nuxt/
+.cache/
+.parcel-cache/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ─── Environment variables ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ─── Alembic ──────────────────────────────────────────────────────────────────
+# Keep versions folder but not auto-generated files if needed
+# backend/alembic/versions/*.py  ← DO NOT ignore, we want these committed
+
+# ─── IDE ──────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ─── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── Uploaded files / media ───────────────────────────────────────────────────
+backend/uploads/
+backend/static/qr_codes/
