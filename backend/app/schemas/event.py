@@ -1,8 +1,8 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import List, Optional
+from typing import Any, List, Optional
 from uuid import UUID
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.models import EventCategory, EventStatus
 from app.schemas.user import UserResponse
 
@@ -54,6 +54,17 @@ class EventCreate(BaseModel):
     registration_start: Optional[datetime] = None
     registration_end: Optional[datetime] = None
     is_seated: bool = False
+    ticket_tiers: Optional[List[TicketTierCreate]] = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_tiers(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "ticket_tiers" not in data and "tiers" in data:
+                data["ticket_tiers"] = data["tiers"]
+        return data
 
 
 class EventUpdate(BaseModel):
@@ -69,6 +80,17 @@ class EventUpdate(BaseModel):
     registration_end: Optional[datetime] = None
     status: Optional[EventStatus] = None
     is_seated: Optional[bool] = None
+    ticket_tiers: Optional[List[TicketTierCreate]] = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_tiers(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "ticket_tiers" not in data and "tiers" in data:
+                data["ticket_tiers"] = data["tiers"]
+        return data
 
 
 class EventResponse(BaseModel):
@@ -91,6 +113,7 @@ class EventResponse(BaseModel):
     organizer: Optional[UserResponse] = None
     venue_name: Optional[str] = None
     tiers: List[TicketTierResponse] = []
+    ticket_tiers: List[TicketTierResponse] = []
 
     model_config = ConfigDict(from_attributes=True)
 

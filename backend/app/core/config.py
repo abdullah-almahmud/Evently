@@ -52,5 +52,26 @@ class Settings(BaseSettings):
             return "https://sandbox.sslcommerz.com"
         return "https://securepay.sslcommerz.com"
 
+    @property
+    def async_database_url(self) -> str:
+        """
+        Normalizes the DATABASE_URL to use the asyncpg driver.
+        Handles postgresql:// or postgres:// and strips any accidental bracket formatting.
+        Also switches port 6543 (transaction pooler) to port 5432 (session pooler)
+        which is required for asyncpg with Supabase pooler.
+        """
+        url = self.DATABASE_URL.strip().replace("[", "").replace("]", "")
+        if url.startswith("postgresql://"):
+            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        elif url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+        
+        # When using Supabase connection pooler, port 5432 (session mode) is compatible
+        # with prepared statements and schema queries
+        if ".pooler.supabase.com:6543" in url:
+            url = url.replace(".pooler.supabase.com:6543", ".pooler.supabase.com:5432")
+
+        return url
+
 
 settings = Settings()

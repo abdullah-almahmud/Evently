@@ -45,9 +45,10 @@ export function EventDetailPage() {
         const eventData = await eventsApi.getEvent(id)
         setEvent(eventData)
 
-        // If tiers were embedded or can be fetched
-        if (eventData.ticket_tiers && eventData.ticket_tiers.length > 0) {
-          setTiers(eventData.ticket_tiers)
+        // Load tiers from event response or fallback to dedicated tier endpoint
+        const eventTiers = eventData.tiers || eventData.ticket_tiers
+        if (eventTiers && eventTiers.length > 0) {
+          setTiers(eventTiers)
         } else {
           try {
             const tiersData = await eventsApi.getEventTiers(id)

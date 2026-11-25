@@ -25,6 +25,7 @@ router = APIRouter()
 def format_event_response(event: Event) -> EventResponse:
     """Helper to convert Event ORM model to EventResponse with nested relationships."""
     venue_name = event.venue.name if event.venue else None
+    tier_responses = [TicketTierResponse.model_validate(t) for t in (event.tiers or [])]
     return EventResponse(
         id=event.id,
         title=event.title,
@@ -43,7 +44,8 @@ def format_event_response(event: Event) -> EventResponse:
         updated_at=event.updated_at,
         organizer=event.organizer,
         venue_name=venue_name,
-        tiers=[TicketTierResponse.model_validate(t) for t in (event.tiers or [])],
+        tiers=tier_responses,
+        ticket_tiers=tier_responses,
     )
 
 
@@ -155,6 +157,23 @@ async def create_event(
         is_seated=data.is_seated,
     )
     db.add(new_event)
+    await db.flush()
+
+    # Create associated ticket tiers if provided in the creation payload
+    if data.ticket_tiers:
+        for t_data in data.ticket_tiers:
+            tier = TicketTier(
+                event_id=new_event.id,
+                name=t_data.name,
+                description=t_data.description,
+                price=t_data.price,
+                total_quantity=t_data.total_quantity,
+                available_quantity=t_data.total_quantity,
+                max_per_user=t_data.max_per_user,
+                is_active=True,
+            )
+            db.add(tier)
+
     await db.commit()
     await db.refresh(new_event)
 
@@ -197,6 +216,7 @@ async def get_event_detail(
 
 
 @router.put("/{event_id}", response_model=EventResponse)
+@router.patch("/{event_id}", response_model=EventResponse)
 async def update_event(
     event_id: UUID,
     data: EventUpdate,
@@ -227,8 +247,25 @@ async def update_event(
         )
 
     update_dict = data.model_dump(exclude_unset=True)
+    # Remove nested tiers from direct model assignment
+    tier_updates = update_dict.pop("ticket_tiers", None)
+
     for field, value in update_dict.items():
         setattr(event, field, value)
+
+    if tier_updates:
+        for t_data in tier_updates:
+            tier = TicketTier(
+                event_id=event.id,
+                name=t_data["name"],
+                description=t_data.get("description"),
+                price=t_data.get("price", Decimal("0.00")),
+                total_quantity=t_data["total_quantity"],
+                available_quantity=t_data["total_quantity"],
+                max_per_user=t_data.get("max_per_user", 4),
+                is_active=True,
+            )
+            db.add(tier)
 
     await db.commit()
     await db.refresh(event)
@@ -376,6 +413,7 @@ async def create_ticket_tier(
 
 
 @router.put("/{event_id}/tiers/{tier_id}", response_model=TicketTierResponse)
+@router.patch("/{event_id}/tiers/{tier_id}", response_model=TicketTierResponse)
 async def update_ticket_tier(
     event_id: UUID,
     tier_id: UUID,

@@ -109,6 +109,7 @@ async def get_venue(
 
 
 @router.put("/{venue_id}", response_model=VenueResponse)
+@router.patch("/{venue_id}", response_model=VenueResponse)
 async def update_venue(
     venue_id: UUID,
     data: VenueUpdate,

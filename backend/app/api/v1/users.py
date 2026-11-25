@@ -25,6 +25,7 @@ async def get_my_profile(
 
 
 @router.put("/me", response_model=UserResponse)
+@router.patch("/me", response_model=UserResponse)
 async def update_my_profile(
     data: UserUpdateRequest,
     current_user: User = Depends(get_current_active_user),

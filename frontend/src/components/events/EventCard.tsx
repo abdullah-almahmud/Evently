@@ -31,8 +31,9 @@ const statusBadgeVariants: Record<string, 'default' | 'secondary' | 'destructive
 export function EventCard({ event }: EventCardProps) {
   // Determine pricing string
   const displayPrice = () => {
-    if (event.ticket_tiers && event.ticket_tiers.length > 0) {
-      const prices = event.ticket_tiers.map((t) => t.price)
+    const tiers = event.tiers || event.ticket_tiers
+    if (tiers && tiers.length > 0) {
+      const prices = tiers.map((t) => Number(t.price))
       const min = Math.min(...prices)
       return min === 0 ? 'Free' : `From ${formatCurrency(min)}`
     }

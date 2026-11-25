@@ -9,10 +9,11 @@ from app.core.config import settings
 
 # Create asynchronous SQLAlchemy engine
 engine = create_async_engine(
-    settings.DATABASE_URL,
+    settings.async_database_url,
     echo=(settings.ENVIRONMENT == "development"),
     future=True,
     pool_pre_ping=True,
+    connect_args={"statement_cache_size": 0, "prepared_statement_cache_size": 0},
 )
 
 # Create session maker for async sessions

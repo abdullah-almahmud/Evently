@@ -1,6 +1,6 @@
 import { useState, useEffect, FormEvent } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { ChevronLeft, Plus, Trash2, Loader2 } from 'lucide-react'
+import { ChevronLeft, Plus, Trash2, Loader2, Pencil } from 'lucide-react'
 import { EventCategory, Venue, TicketTier } from '@/types'
 import { eventsApi, venuesApi } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -15,7 +15,16 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Badge } from '@/components/ui/badge'
 import { toast } from 'sonner'
 
 export function EditEventPage() {
@@ -40,6 +49,18 @@ export function EditEventPage() {
 
   const [isLoading, setIsLoading] = useState(true)
   const [isSubmitting, setIsSubmitting] = useState(false)
+
+  // Tier Modal State
+  const [isTierModalOpen, setIsTierModalOpen] = useState(false)
+  const [editingTier, setEditingTier] = useState<TicketTier | null>(null)
+  const [tierForm, setTierForm] = useState({
+    name: '',
+    price: 0,
+    total_quantity: 50,
+    max_per_user: 4,
+    description: '',
+  })
+  const [isTierSaving, setIsTierSaving] = useState(false)
 
   // Format date helper for datetime-local input
   const toLocalISO = (isoString?: string | null) => {
@@ -78,7 +99,9 @@ export function EditEventPage() {
         setIsSeated(eventData.is_seated)
 
         setVenues(venuesList || [])
-        setTiers(tiersList || [])
+        // Use either dedicated tier list or embedded tiers
+        const loadedTiers = (tiersList && tiersList.length > 0) ? tiersList : (eventData.tiers || eventData.ticket_tiers || [])
+        setTiers(loadedTiers)
       } catch (err) {
         console.error('Failed to load event for editing:', err)
         toast.error('Failed to load event data.')
@@ -90,19 +113,78 @@ export function EditEventPage() {
     loadData()
   }, [id])
 
-  const handleAddTier = async () => {
+  const openAddTierModal = () => {
+    setEditingTier(null)
+    setTierForm({
+      name: '',
+      price: 0,
+      total_quantity: 50,
+      max_per_user: 4,
+      description: '',
+    })
+    setIsTierModalOpen(true)
+  }
+
+  const openEditTierModal = (tier: TicketTier) => {
+    setEditingTier(tier)
+    setTierForm({
+      name: tier.name,
+      price: Number(tier.price),
+      total_quantity: tier.total_quantity,
+      max_per_user: tier.max_per_user,
+      description: tier.description || '',
+    })
+    setIsTierModalOpen(true)
+  }
+
+  const handleSaveTier = async (e: FormEvent) => {
+    e.preventDefault()
     if (!id) return
+
+    if (!tierForm.name.trim()) {
+      toast.error('Tier name is required.')
+      return
+    }
+    if (tierForm.total_quantity <= 0) {
+      toast.error('Total quantity must be greater than 0.')
+      return
+    }
+    if (tierForm.price < 0) {
+      toast.error('Price cannot be negative.')
+      return
+    }
+
     try {
-      const newTier = await eventsApi.createTier(id, {
-        name: 'New Ticket Tier',
-        price: 0,
-        total_quantity: 50,
-        max_per_user: 2,
-      })
-      setTiers([...tiers, newTier])
-      toast.success('Ticket tier added.')
-    } catch {
-      toast.error('Failed to add ticket tier.')
+      setIsTierSaving(true)
+      if (editingTier) {
+        const updated = await eventsApi.updateTier(id, editingTier.id, {
+          name: tierForm.name.trim(),
+          price: Number(tierForm.price),
+          total_quantity: Number(tierForm.total_quantity),
+          max_per_user: Number(tierForm.max_per_user),
+          description: tierForm.description.trim() || undefined,
+        })
+        setTiers(tiers.map((t) => (t.id === editingTier.id ? updated : t)))
+        toast.success(`Tier "${updated.name}" updated successfully!`)
+      } else {
+        const created = await eventsApi.createTier(id, {
+          name: tierForm.name.trim(),
+          price: Number(tierForm.price),
+          total_quantity: Number(tierForm.total_quantity),
+          max_per_user: Number(tierForm.max_per_user),
+          description: tierForm.description.trim() || undefined,
+        })
+        setTiers([...tiers, created])
+        toast.success(`Tier "${created.name}" added successfully!`)
+      }
+      setIsTierModalOpen(false)
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+        'Failed to save ticket tier.'
+      toast.error(msg)
+    } finally {
+      setIsTierSaving(false)
     }
   }
 
@@ -112,12 +194,18 @@ export function EditEventPage() {
       toast.warning('Event must keep at least one ticket tier.')
       return
     }
+    if (!window.confirm('Are you sure you want to delete this ticket tier?')) {
+      return
+    }
     try {
       await eventsApi.deleteTier(id, tierId)
       setTiers(tiers.filter((t) => t.id !== tierId))
       toast.success('Ticket tier removed.')
-    } catch {
-      toast.error('Failed to delete ticket tier.')
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+        'Failed to delete ticket tier.'
+      toast.error(msg)
     }
   }
 
@@ -317,37 +405,73 @@ export function EditEventPage() {
           <CardHeader className="flex flex-row items-center justify-between">
             <div>
               <CardTitle className="text-lg">Ticket Tiers</CardTitle>
-              <CardDescription>Existing tiers associated with this event</CardDescription>
+              <CardDescription>
+                Configure pricing and capacity allocations for this event (editable anytime)
+              </CardDescription>
             </div>
-            <Button type="button" variant="outline" size="sm" onClick={handleAddTier} className="gap-1.5">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={openAddTierModal}
+              className="gap-1.5"
+            >
               <Plus className="h-4 w-4" />
               Add Tier
             </Button>
           </CardHeader>
           <CardContent className="space-y-3">
             {tiers.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No custom ticket tiers set.</p>
+              <div className="text-center py-6 border border-dashed rounded-lg space-y-2">
+                <p className="text-sm text-muted-foreground">No ticket tiers configured for this event.</p>
+                <Button type="button" variant="outline" size="sm" onClick={openAddTierModal}>
+                  Create First Ticket Tier
+                </Button>
+              </div>
             ) : (
               tiers.map((tier) => (
                 <div
                   key={tier.id}
-                  className="flex items-center justify-between p-3 rounded-lg border bg-muted/20"
+                  className="flex flex-col sm:flex-row sm:items-center justify-between p-4 rounded-lg border bg-muted/20 gap-3"
                 >
-                  <div>
-                    <h4 className="font-semibold text-sm">{tier.name}</h4>
-                    <p className="text-xs text-muted-foreground">
-                      Price: ৳{tier.price} | Total: {tier.total_quantity} | Available: {tier.available_quantity}
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2">
+                      <h4 className="font-semibold text-sm text-foreground">{tier.name}</h4>
+                      <Badge variant="outline" className="font-bold text-primary">
+                        {Number(tier.price) === 0 ? 'Free' : `৳${tier.price}`}
+                      </Badge>
+                      <Badge variant="secondary" className="text-xs">
+                        {tier.available_quantity} / {tier.total_quantity} left
+                      </Badge>
+                    </div>
+                    {tier.description && (
+                      <p className="text-xs text-muted-foreground">{tier.description}</p>
+                    )}
+                    <p className="text-[11px] text-muted-foreground">
+                      Limit: {tier.max_per_user} {tier.max_per_user === 1 ? 'ticket' : 'tickets'} per attendee
                     </p>
                   </div>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => handleDeleteTier(tier.id)}
-                    className="text-destructive hover:bg-destructive/10"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </Button>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => openEditTierModal(tier)}
+                      className="gap-1 h-8 text-xs"
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                      Edit
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => handleDeleteTier(tier.id)}
+                      className="h-8 text-destructive hover:bg-destructive/10"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </div>
                 </div>
               ))
             )}
@@ -370,6 +494,114 @@ export function EditEventPage() {
           </Button>
         </div>
       </form>
+
+      {/* Add / Edit Tier Modal */}
+      <Dialog open={isTierModalOpen} onOpenChange={setIsTierModalOpen}>
+        <DialogContent className="sm:max-w-md">
+          <form onSubmit={handleSaveTier}>
+            <DialogHeader>
+              <DialogTitle>
+                {editingTier ? `Edit Tier: ${editingTier.name}` : 'Add New Ticket Tier'}
+              </DialogTitle>
+              <DialogDescription>
+                Configure pricing, capacity, and attendee limits for this ticket tier.
+              </DialogDescription>
+            </DialogHeader>
+
+            <div className="space-y-4 py-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="tierName">Tier Name *</Label>
+                <Input
+                  id="tierName"
+                  placeholder="e.g. VIP Pass, Early Bird, General"
+                  value={tierForm.name}
+                  onChange={(e) => setTierForm({ ...tierForm, name: e.target.value })}
+                  required
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <Label htmlFor="tierPrice">Price (BDT ৳ — 0 for Free) *</Label>
+                  <Input
+                    id="tierPrice"
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={tierForm.price}
+                    onChange={(e) =>
+                      setTierForm({ ...tierForm, price: parseFloat(e.target.value) || 0 })
+                    }
+                    required
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label htmlFor="tierQty">Total Quantity *</Label>
+                  <Input
+                    id="tierQty"
+                    type="number"
+                    min="1"
+                    value={tierForm.total_quantity}
+                    onChange={(e) =>
+                      setTierForm({ ...tierForm, total_quantity: parseInt(e.target.value) || 1 })
+                    }
+                    required
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="tierLimit">Max Tickets per Attendee *</Label>
+                <Input
+                  id="tierLimit"
+                  type="number"
+                  min="1"
+                  max="20"
+                  value={tierForm.max_per_user}
+                  onChange={(e) =>
+                    setTierForm({ ...tierForm, max_per_user: parseInt(e.target.value) || 1 })
+                  }
+                  required
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="tierDesc">Perks / Description (Optional)</Label>
+                <Input
+                  id="tierDesc"
+                  placeholder="Includes refreshments, front-row seat & kit"
+                  value={tierForm.description}
+                  onChange={(e) => setTierForm({ ...tierForm, description: e.target.value })}
+                />
+              </div>
+            </div>
+
+            <DialogFooter className="gap-2 sm:gap-0">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setIsTierModalOpen(false)}
+                disabled={isTierSaving}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={isTierSaving}>
+                {isTierSaving ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Saving...
+                  </>
+                ) : editingTier ? (
+                  'Update Tier'
+                ) : (
+                  'Add Tier'
+                )}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

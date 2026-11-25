@@ -47,8 +47,11 @@ export function OrganizerEventsPage() {
       await eventsApi.publishEvent(id)
       toast.success('Event published successfully! It is now visible to attendees.')
       loadMyEvents()
-    } catch (err) {
-      toast.error('Failed to publish event. Please check required fields.')
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+        'Failed to publish event. Please ensure the event has at least one ticket tier.'
+      toast.error(msg)
       console.error(err)
     } finally {
       setActionLoadingId(null)
@@ -146,6 +149,7 @@ export function OrganizerEventsPage() {
                   <tr>
                     <th className="py-3 px-4">Event Title</th>
                     <th className="py-3 px-4">Status</th>
+                    <th className="py-3 px-4">Tiers</th>
                     <th className="py-3 px-4">Date & Time</th>
                     <th className="py-3 px-4">Category</th>
                     <th className="py-3 px-4 text-right">Actions</th>
@@ -154,6 +158,7 @@ export function OrganizerEventsPage() {
                 <tbody className="divide-y divide-border">
                   {events.map((event) => {
                     const isBusy = actionLoadingId === event.id
+                    const tierCount = event.tiers?.length ?? event.ticket_tiers?.length ?? 0
                     return (
                       <tr key={event.id} className="hover:bg-muted/30 transition-colors">
                         <td className="py-3 px-4 font-medium text-foreground">
@@ -165,6 +170,17 @@ export function OrganizerEventsPage() {
                           </Link>
                         </td>
                         <td className="py-3 px-4">{getStatusBadge(event.status)}</td>
+                        <td className="py-3 px-4">
+                          {tierCount > 0 ? (
+                            <Badge variant="outline" className="text-xs font-normal">
+                              {tierCount} {tierCount === 1 ? 'tier' : 'tiers'}
+                            </Badge>
+                          ) : (
+                            <Badge variant="destructive" className="text-xs font-normal">
+                              0 tiers
+                            </Badge>
+                          )}
+                        </td>
                         <td className="py-3 px-4 text-xs text-muted-foreground">
                           <div className="flex items-center gap-1.5">
                             <Calendar className="h-3.5 w-3.5 text-primary" />

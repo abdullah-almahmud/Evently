@@ -71,9 +71,12 @@ export interface Event {
   status: EventStatus
   is_seated: boolean
   created_at: string
+  updated_at?: string
   // Optional enriched relations
   venue?: Venue
+  venue_name?: string | null
   organizer?: User
+  tiers?: TicketTier[]
   ticket_tiers?: TicketTier[]
   min_price?: number
   max_price?: number
