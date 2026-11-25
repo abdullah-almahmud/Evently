@@ -9,6 +9,8 @@ import {
   Ban,
   Loader2,
   FolderOpen,
+  Users,
+  UserCheck,
 } from 'lucide-react'
 import { Event } from '@/types'
 import { eventsApi } from '@/lib/api'
@@ -213,6 +215,20 @@ export function OrganizerEventsPage() {
                               <Link to={`/organizer/events/${event.id}/edit`}>
                                 <Edit className="h-3.5 w-3.5" />
                                 Edit
+                              </Link>
+                            </Button>
+
+                            <Button variant="ghost" size="sm" asChild className="h-8 gap-1">
+                              <Link to={`/organizer/events/${event.id}/staff`}>
+                                <Users className="h-3.5 w-3.5" />
+                                Staff
+                              </Link>
+                            </Button>
+
+                            <Button variant="ghost" size="sm" asChild className="h-8 gap-1">
+                              <Link to={`/organizer/events/${event.id}/volunteers`}>
+                                <UserCheck className="h-3.5 w-3.5" />
+                                Volunteers
                               </Link>
                             </Button>
 

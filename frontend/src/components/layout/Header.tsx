@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link, NavLink, useNavigate } from 'react-router-dom'
-import { Calendar, Menu, X, User as UserIcon, Ticket, LogOut, Shield, Compass, PlusCircle, Building2 } from 'lucide-react'
+import { Calendar, Menu, X, User as UserIcon, Ticket, LogOut, Shield, Compass, PlusCircle, Building2, ShieldCheck, ShoppingBag } from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
 import { Button } from '@/components/ui/button'
 import {
@@ -62,12 +62,26 @@ export function Header() {
             </NavLink>
 
             {isAuthenticated && (
-              <NavLink to="/tickets" className={navLinkClass}>
-                <span className="flex items-center gap-1.5">
-                  <Ticket className="h-4 w-4" />
-                  My Tickets
-                </span>
-              </NavLink>
+              <>
+                <NavLink to="/my-bookings" className={navLinkClass}>
+                  <span className="flex items-center gap-1.5">
+                    <ShoppingBag className="h-4 w-4" />
+                    My Bookings
+                  </span>
+                </NavLink>
+                <NavLink to="/tickets" className={navLinkClass}>
+                  <span className="flex items-center gap-1.5">
+                    <Ticket className="h-4 w-4" />
+                    My Tickets
+                  </span>
+                </NavLink>
+                <NavLink to="/staff/events" className={navLinkClass}>
+                  <span className="flex items-center gap-1.5 text-indigo-600 dark:text-indigo-400">
+                    <ShieldCheck className="h-4 w-4" />
+                    Staff Portal
+                  </span>
+                </NavLink>
+              </>
             )}
 
             {isOrganizer && (
@@ -138,9 +152,21 @@ export function Header() {
                   </Link>
                 </DropdownMenuItem>
                 <DropdownMenuItem asChild>
+                  <Link to="/my-bookings" className="cursor-pointer flex items-center">
+                    <ShoppingBag className="mr-2 h-4 w-4" />
+                    <span>My Bookings</span>
+                  </Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild>
                   <Link to="/tickets" className="cursor-pointer flex items-center">
                     <Ticket className="mr-2 h-4 w-4" />
                     <span>My Tickets</span>
+                  </Link>
+                </DropdownMenuItem>
+                <DropdownMenuItem asChild>
+                  <Link to="/staff/events" className="cursor-pointer flex items-center text-indigo-600 dark:text-indigo-400">
+                    <ShieldCheck className="mr-2 h-4 w-4" />
+                    <span>Staff Portal</span>
                   </Link>
                 </DropdownMenuItem>
 
@@ -221,13 +247,29 @@ export function Header() {
             </Link>
 
             {isAuthenticated && (
-              <Link
-                to="/tickets"
-                onClick={() => setMobileMenuOpen(false)}
-                className="px-3 py-2 text-sm font-medium rounded-md hover:bg-accent"
-              >
-                My Tickets
-              </Link>
+              <>
+                <Link
+                  to="/my-bookings"
+                  onClick={() => setMobileMenuOpen(false)}
+                  className="px-3 py-2 text-sm font-medium rounded-md hover:bg-accent"
+                >
+                  My Bookings
+                </Link>
+                <Link
+                  to="/tickets"
+                  onClick={() => setMobileMenuOpen(false)}
+                  className="px-3 py-2 text-sm font-medium rounded-md hover:bg-accent"
+                >
+                  My Tickets
+                </Link>
+                <Link
+                  to="/staff/events"
+                  onClick={() => setMobileMenuOpen(false)}
+                  className="px-3 py-2 text-sm font-medium rounded-md hover:bg-accent text-indigo-600 dark:text-indigo-400"
+                >
+                  Staff Portal
+                </Link>
+              </>
             )}
 
             {isOrganizer && (

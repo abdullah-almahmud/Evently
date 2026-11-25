@@ -20,6 +20,12 @@ import type {
   CreateVenueRequest,
   UpdateVenueRequest,
   EventFilterParams,
+  VolunteerApplication,
+  EventStaff,
+  CreateBookingRequest,
+  CheckInResult,
+  CheckInStats,
+  CheckInTicketItem,
 } from '@/types'
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1'
@@ -323,12 +329,98 @@ export const ticketsApi = {
 }
 
 export const bookingsApi = {
-  createBooking: async (data: {
-    event_id: string
-    tier_id: string
-    quantity: number
-  }): Promise<Booking> => {
-    const res = await api.post<Booking>('/bookings', data)
+  create: async (data: CreateBookingRequest): Promise<Booking> => {
+    const res = await api.post<Booking>('/bookings/', data)
+    return res.data
+  },
+
+  getMyBookings: async (): Promise<Booking[]> => {
+    const res = await api.get<Booking[]>('/bookings/my-bookings')
+    return res.data
+  },
+
+  getBooking: async (id: string): Promise<Booking> => {
+    const res = await api.get<Booking>(`/bookings/${id}`)
+    return res.data
+  },
+
+  cancel: async (id: string): Promise<void> => {
+    await api.post(`/bookings/${id}/cancel`)
+  },
+
+  getEventBookings: async (eventId: string): Promise<Booking[]> => {
+    const res = await api.get<Booking[]>(`/bookings/event/${eventId}`)
+    return res.data
+  },
+}
+
+export const volunteerApi = {
+  apply: async (eventId: string, motivation: string): Promise<VolunteerApplication> => {
+    const res = await api.post<VolunteerApplication>(`/events/${eventId}/volunteer-apply`, {
+      motivation,
+    })
+    return res.data
+  },
+
+  getMyStatus: async (eventId: string): Promise<VolunteerApplication | null> => {
+    try {
+      const res = await api.get<VolunteerApplication>(`/events/${eventId}/my-volunteer-status`)
+      return res.data
+    } catch (err: unknown) {
+      if (axios.isAxiosError(err) && err.response?.status === 404) {
+        return null
+      }
+      throw err
+    }
+  },
+
+  listApplications: async (eventId: string): Promise<VolunteerApplication[]> => {
+    const res = await api.get<VolunteerApplication[]>(`/events/${eventId}/volunteer-applications`)
+    return res.data
+  },
+
+  review: async (
+    eventId: string,
+    appId: string,
+    status: 'APPROVED' | 'REJECTED'
+  ): Promise<VolunteerApplication> => {
+    const res = await api.post<VolunteerApplication>(
+      `/events/${eventId}/volunteer-applications/${appId}/review`,
+      { status }
+    )
+    return res.data
+  },
+}
+
+export const staffApi = {
+  listEventStaff: async (eventId: string): Promise<EventStaff[]> => {
+    const res = await api.get<EventStaff[]>(`/events/${eventId}/staff`)
+    return res.data
+  },
+
+  removeStaff: async (eventId: string, staffId: string): Promise<void> => {
+    await api.delete(`/events/${eventId}/staff/${staffId}`)
+  },
+
+  getMyEvents: async (): Promise<Event[]> => {
+    const res = await api.get<Event[]>('/staff/my-events')
+    return res.data
+  },
+}
+
+export const checkinApi = {
+  validate: async (qrCode: string): Promise<CheckInResult> => {
+    const res = await api.post<CheckInResult>('/checkin/validate', { qr_code: qrCode })
+    return res.data
+  },
+
+  getStats: async (eventId: string): Promise<CheckInStats> => {
+    const res = await api.get<CheckInStats>(`/checkin/event/${eventId}/stats`)
+    return res.data
+  },
+
+  getTicketList: async (eventId: string): Promise<CheckInTicketItem[]> => {
+    const res = await api.get<CheckInTicketItem[]>(`/checkin/event/${eventId}/tickets`)
     return res.data
   },
 }

@@ -93,6 +93,11 @@ class Event(Base):
     staff = relationship("EventStaff", back_populates="event", cascade="all, delete-orphan")
     resource_bookings = relationship("ResourceBooking", back_populates="event", cascade="all, delete-orphan")
     waitlist_entries = relationship("EventWaitlist", back_populates="event", cascade="all, delete-orphan")
+    volunteer_applications = relationship(
+        "VolunteerApplication",
+        back_populates="event",
+        cascade="all, delete-orphan",
+    )
 
 
 class TicketTier(Base):

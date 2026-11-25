@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { useParams, Link } from 'react-router-dom'
+import { useParams, Link, useNavigate } from 'react-router-dom'
 import {
   Calendar,
   MapPin,
@@ -11,18 +11,29 @@ import {
   Clock,
   Sparkles,
   Info,
+  Minus,
+  Plus,
+  ShieldCheck,
+  HeartHandshake,
+  Loader2,
+  AlertCircle,
+  ExternalLink,
 } from 'lucide-react'
-import { Event, TicketTier } from '@/types'
-import { eventsApi } from '@/lib/api'
+import { Event, TicketTier, VolunteerApplication, Booking } from '@/types'
+import { eventsApi, bookingsApi, volunteerApi } from '@/lib/api'
 import { formatDateRange, formatCurrency } from '@/lib/utils'
+import { useAuth } from '@/hooks/useAuth'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Textarea } from '@/components/ui/textarea'
+import { Label } from '@/components/ui/label'
 import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
@@ -30,51 +41,152 @@ import { toast } from 'sonner'
 
 export function EventDetailPage() {
   const { id } = useParams<{ id: string }>()
+  const navigate = useNavigate()
+  const { user, isAuthenticated } = useAuth()
+
   const [event, setEvent] = useState<Event | null>(null)
   const [tiers, setTiers] = useState<TicketTier[]>([])
   const [isLoading, setIsLoading] = useState(true)
-  const [bookingModalOpen, setBookingModalOpen] = useState(false)
-  const [selectedTier, setSelectedTier] = useState<TicketTier | null>(null)
+
+  // Booking state
+  const [selectedQuantities, setSelectedQuantities] = useState<Record<string, number>>({})
+  const [isBooking, setIsBooking] = useState(false)
+  const [confirmedBooking, setConfirmedBooking] = useState<Booking | null>(null)
+  const [bookingSuccessModalOpen, setBookingSuccessModalOpen] = useState(false)
+
+  // Volunteer state
+  const [volunteerApp, setVolunteerApp] = useState<VolunteerApplication | null>(null)
+  const [volunteerModalOpen, setVolunteerModalOpen] = useState(false)
+  const [volunteerMotivation, setVolunteerMotivation] = useState('')
+  const [isSubmittingVolunteer, setIsSubmittingVolunteer] = useState(false)
+
+  const isOrganizerOfThisEvent = Boolean(
+    user && event && (user.id === event.organizer_id || user.role === 'ADMIN')
+  )
+
+  const fetchDetails = async () => {
+    if (!id) return
+    try {
+      setIsLoading(true)
+      const eventData = await eventsApi.getEvent(id)
+      setEvent(eventData)
+
+      // Load tiers
+      const eventTiers = eventData.tiers || eventData.ticket_tiers
+      if (eventTiers && eventTiers.length > 0) {
+        setTiers(eventTiers)
+      } else {
+        try {
+          const tiersData = await eventsApi.getEventTiers(id)
+          setTiers(tiersData || [])
+        } catch {
+          setTiers([])
+        }
+      }
+
+      // Check volunteer status if authenticated
+      if (isAuthenticated) {
+        try {
+          const statusData = await volunteerApi.getMyStatus(id)
+          setVolunteerApp(statusData)
+        } catch {
+          setVolunteerApp(null)
+        }
+      }
+    } catch (err) {
+      console.error('Failed to load event details:', err)
+    } finally {
+      setIsLoading(false)
+    }
+  }
 
   useEffect(() => {
-    if (!id) return
-
-    const fetchDetails = async () => {
-      try {
-        setIsLoading(true)
-        const eventData = await eventsApi.getEvent(id)
-        setEvent(eventData)
-
-        // Load tiers from event response or fallback to dedicated tier endpoint
-        const eventTiers = eventData.tiers || eventData.ticket_tiers
-        if (eventTiers && eventTiers.length > 0) {
-          setTiers(eventTiers)
-        } else {
-          try {
-            const tiersData = await eventsApi.getEventTiers(id)
-            setTiers(tiersData || [])
-          } catch {
-            setTiers([])
-          }
-        }
-      } catch (err) {
-        console.error('Failed to load event details:', err)
-      } finally {
-        setIsLoading(false)
-      }
-    }
-
     fetchDetails()
-  }, [id])
+  }, [id, isAuthenticated])
 
   const handleShare = () => {
     navigator.clipboard.writeText(window.location.href)
     toast.success('Event link copied to clipboard!')
   }
 
-  const handleBookTicket = (tier?: TicketTier) => {
-    setSelectedTier(tier || (tiers.length > 0 ? tiers[0] : null))
-    setBookingModalOpen(true)
+  const handleQuantityChange = (tierId: string, delta: number, maxAllowed: number) => {
+    setSelectedQuantities((prev) => {
+      const current = prev[tierId] || 0
+      const updated = Math.max(0, Math.min(maxAllowed, current + delta))
+      return { ...prev, [tierId]: updated }
+    })
+  }
+
+  const totalTicketsSelected = Object.values(selectedQuantities).reduce((a, b) => a + b, 0)
+
+  const totalCost = tiers.reduce((sum, tier) => {
+    const qty = selectedQuantities[tier.id] || 0
+    return sum + Number(tier.price) * qty
+  }, 0)
+
+  const handleCreateBooking = async () => {
+    if (!isAuthenticated) {
+      toast.info('Please log in to book tickets.')
+      navigate(`/auth/login?redirect=/events/${id}`)
+      return
+    }
+
+    if (isOrganizerOfThisEvent) {
+      toast.error('You are an organizer for this event.')
+      return
+    }
+
+    const items = Object.entries(selectedQuantities)
+      .filter(([_, qty]) => qty > 0)
+      .map(([tier_id, quantity]) => ({ tier_id, quantity }))
+
+    if (items.length === 0) {
+      toast.warning('Please select at least one ticket before proceeding.')
+      return
+    }
+
+    try {
+      setIsBooking(true)
+      const booking = await bookingsApi.create({
+        event_id: id!,
+        items,
+      })
+
+      setConfirmedBooking(booking)
+      setBookingSuccessModalOpen(true)
+      setSelectedQuantities({})
+      toast.success('Booking confirmed! Digital tickets issued.')
+      // Refresh event details to update available quantities
+      fetchDetails()
+    } catch (err: unknown) {
+      const errorMsg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+        'Failed to complete booking. Please try again.'
+      toast.error(errorMsg)
+    } finally {
+      setIsBooking(false)
+    }
+  }
+
+  const handleVolunteerApply = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!id || !volunteerMotivation.trim()) return
+
+    try {
+      setIsSubmittingVolunteer(true)
+      const app = await volunteerApi.apply(id, volunteerMotivation.trim())
+      setVolunteerApp(app)
+      setVolunteerModalOpen(false)
+      setVolunteerMotivation('')
+      toast.success('Volunteer application submitted! The organizer will review it soon.')
+    } catch (err: unknown) {
+      const errorMsg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+        'Failed to submit volunteer application.'
+      toast.error(errorMsg)
+    } finally {
+      setIsSubmittingVolunteer(false)
+    }
   }
 
   if (isLoading) {
@@ -98,106 +210,109 @@ export function EventDetailPage() {
   if (!event) {
     return (
       <div className="container mx-auto px-4 py-16 text-center max-w-md space-y-4">
-        <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-destructive/10 text-destructive">
-          <Info className="h-6 w-6" />
-        </div>
         <h2 className="text-2xl font-bold">Event Not Found</h2>
         <p className="text-muted-foreground text-sm">
-          The event you are looking for may have been removed or does not exist.
+          The requested event could not be found or has been removed.
         </p>
         <Button asChild>
-          <Link to="/">Back to All Events</Link>
+          <Link to="/">Browse Other Events</Link>
         </Button>
       </div>
     )
   }
 
   return (
-    <div className="container mx-auto px-4 py-6 max-w-5xl space-y-8">
-      {/* Top back & actions */}
-      <div className="flex items-center justify-between">
-        <Button variant="ghost" size="sm" asChild className="gap-1 text-muted-foreground hover:text-foreground">
+    <div className="container mx-auto px-4 py-8 max-w-5xl space-y-8">
+      {/* Back button */}
+      <div>
+        <Button variant="ghost" size="sm" asChild className="gap-1 text-muted-foreground">
           <Link to="/">
             <ChevronLeft className="h-4 w-4" />
-            All Events
+            Back to Events
           </Link>
-        </Button>
-
-        <Button variant="outline" size="sm" onClick={handleShare} className="gap-1.5">
-          <Share2 className="h-4 w-4" />
-          Share Event
         </Button>
       </div>
 
       {/* Hero Banner */}
-      <div className="relative aspect-[21/9] w-full overflow-hidden rounded-2xl bg-gradient-to-r from-slate-900 via-indigo-950 to-primary/80 shadow-md">
+      <div className="relative aspect-[21/9] w-full overflow-hidden rounded-2xl border bg-muted shadow-sm">
         {event.banner_url ? (
           <img
             src={event.banner_url}
             alt={event.title}
             className="h-full w-full object-cover"
-            onError={(e) => {
-              ;(e.target as HTMLElement).style.display = 'none'
-            }}
           />
         ) : (
-          <div className="h-full w-full flex items-center justify-center p-8 text-center text-white/90">
-            <div>
-              <Sparkles className="mx-auto h-12 w-12 text-primary/80 mb-3" />
-              <h1 className="text-3xl md:text-4xl font-extrabold max-w-2xl">{event.title}</h1>
-            </div>
+          <div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-primary/20 via-background to-secondary/30">
+            <Calendar className="h-16 w-16 text-primary/40" />
           </div>
         )}
-
-        <div className="absolute top-4 left-4 flex gap-2">
-          <Badge variant="secondary" className="backdrop-blur-md bg-background/80 font-medium">
+        <div className="absolute top-4 right-4 flex gap-2">
+          <Badge className="bg-background/80 text-foreground backdrop-blur font-mono text-xs shadow-sm">
             {event.category}
           </Badge>
-          {event.status !== 'PUBLISHED' && (
-            <Badge variant="destructive">{event.status.replace('_', ' ')}</Badge>
-          )}
+          <Badge
+            variant={event.status === 'PUBLISHED' ? 'default' : 'secondary'}
+            className="shadow-sm"
+          >
+            {event.status}
+          </Badge>
         </div>
       </div>
 
       {/* Main Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        {/* Left Column: Details & Description */}
-        <div className="lg:col-span-2 space-y-6">
-          <div className="space-y-3">
-            <h1 className="text-3xl md:text-4xl font-extrabold tracking-tight text-foreground">
+        {/* Left 2 Cols: Details */}
+        <div className="lg:col-span-2 space-y-8">
+          <div>
+            <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight text-foreground">
               {event.title}
             </h1>
-
-            <div className="flex flex-wrap gap-4 text-sm text-muted-foreground pt-1">
-              <div className="flex items-center gap-2">
-                <Calendar className="h-4 w-4 text-primary shrink-0" />
-                <span>{formatDateRange(event.start_datetime, event.end_datetime)}</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <MapPin className="h-4 w-4 text-primary shrink-0" />
-                <span>{event.venue?.name || 'Main Auditorium, UIU'}</span>
-              </div>
+            <div className="mt-3 flex flex-wrap items-center gap-4 text-sm text-muted-foreground">
+              <span className="flex items-center gap-1.5">
+                <Calendar className="h-4 w-4 text-primary" />
+                {formatDateRange(event.start_datetime, event.end_datetime)}
+              </span>
+              <span className="flex items-center gap-1.5">
+                <MapPin className="h-4 w-4 text-primary" />
+                {event.venue?.name || event.venue_name || 'UIU Campus'}
+              </span>
             </div>
           </div>
 
-          <div className="rounded-xl border bg-card p-6 space-y-4">
-            <h2 className="text-xl font-bold">About this event</h2>
-            <div className="text-foreground/90 whitespace-pre-line leading-relaxed text-sm md:text-base">
-              {event.description}
-            </div>
+          {/* Quick Actions */}
+          <div className="flex items-center gap-3">
+            <Button variant="outline" size="sm" onClick={handleShare} className="gap-1.5">
+              <Share2 className="h-4 w-4" />
+              Share Event
+            </Button>
+            {isOrganizerOfThisEvent && (
+              <Button variant="outline" size="sm" asChild className="gap-1.5">
+                <Link to={`/organizer/events/${event.id}/edit`}>
+                  Manage Event
+                </Link>
+              </Button>
+            )}
+          </div>
+
+          {/* Description */}
+          <div className="space-y-3">
+            <h3 className="text-xl font-bold tracking-tight">About this Event</h3>
+            <p className="text-muted-foreground whitespace-pre-line leading-relaxed text-sm">
+              {event.description || 'No description provided for this campus event.'}
+            </p>
           </div>
 
           {/* Venue & Organizer Details */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
             <Card>
               <CardHeader className="pb-3">
                 <CardTitle className="text-base flex items-center gap-2">
                   <MapPin className="h-4 w-4 text-primary" />
-                  Venue Details
+                  Venue Information
                 </CardTitle>
               </CardHeader>
               <CardContent className="text-sm space-y-1">
-                <p className="font-semibold text-foreground">{event.venue?.name || 'UIU Campus Venue'}</p>
+                <p className="font-semibold text-foreground">{event.venue?.name || event.venue_name || 'UIU Campus Venue'}</p>
                 <p className="text-muted-foreground text-xs">
                   {event.venue?.address || 'United City, Madani Avenue, Badda, Dhaka 1212'}
                 </p>
@@ -224,6 +339,93 @@ export function EventDetailPage() {
               </CardContent>
             </Card>
           </div>
+
+          {/* Volunteer Section */}
+          {!isOrganizerOfThisEvent && (
+            <Card className="border-indigo-500/20 bg-indigo-500/5">
+              <CardHeader className="pb-3">
+                <div className="flex items-center justify-between">
+                  <CardTitle className="text-base flex items-center gap-2 text-foreground">
+                    <HeartHandshake className="h-5 w-5 text-indigo-600 dark:text-indigo-400" />
+                    Volunteer for this Event
+                  </CardTitle>
+                  {volunteerApp && (
+                    <Badge
+                      variant={
+                        volunteerApp.status === 'APPROVED'
+                          ? 'default'
+                          : volunteerApp.status === 'REJECTED'
+                          ? 'destructive'
+                          : 'secondary'
+                      }
+                    >
+                      {volunteerApp.status === 'APPROVED'
+                        ? 'Staff Volunteer ✓'
+                        : volunteerApp.status === 'REJECTED'
+                        ? 'Not Selected'
+                        : 'Application Pending'}
+                    </Badge>
+                  )}
+                </div>
+                <CardDescription className="text-xs">
+                  Join the volunteer team to help coordinate attendee entry and gate check-in scanning.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {volunteerApp ? (
+                  <div className="text-xs space-y-2">
+                    {volunteerApp.status === 'APPROVED' ? (
+                      <div className="p-3 bg-emerald-500/10 border border-emerald-500/20 rounded-lg text-emerald-800 dark:text-emerald-300 space-y-2">
+                        <p className="font-semibold flex items-center gap-1.5">
+                          <CheckCircle2 className="h-4 w-4" />
+                          You are an approved Gate Staff volunteer for this event!
+                        </p>
+                        <p className="text-xs opacity-90">
+                          You have gate check-in privileges to scan attendee QR tickets on event day.
+                        </p>
+                        <Button size="sm" asChild className="gap-1.5 mt-1 bg-emerald-600 hover:bg-emerald-700">
+                          <Link to={`/staff/gate/${event.id}`}>
+                            Open Gate Scanner
+                            <ExternalLink className="h-3.5 w-3.5" />
+                          </Link>
+                        </Button>
+                      </div>
+                    ) : volunteerApp.status === 'PENDING' ? (
+                      <p className="text-muted-foreground">
+                        Your application is currently pending review by the event organizer. You will be notified once reviewed.
+                      </p>
+                    ) : (
+                      <p className="text-muted-foreground">
+                        Your volunteer application was not accepted for this event. Thank you for your interest!
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 pt-1">
+                    <p className="text-xs text-muted-foreground">
+                      Help organize gate validation and attendee assistance on event day.
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="border-indigo-500/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-950/30 shrink-0"
+                      onClick={() => {
+                        if (!isAuthenticated) {
+                          toast.info('Please log in to apply as a volunteer.')
+                          navigate(`/auth/login?redirect=/events/${id}`)
+                          return
+                        }
+                        setVolunteerModalOpen(true)
+                      }}
+                    >
+                      <ShieldCheck className="h-4 w-4 mr-1.5" />
+                      Apply to Volunteer
+                    </Button>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          )}
         </div>
 
         {/* Right Column: Ticket Tiers & Booking Card */}
@@ -231,9 +433,12 @@ export function EventDetailPage() {
           <Card className="sticky top-24 border-primary/20 shadow-md">
             <CardHeader className="pb-4">
               <CardTitle className="text-lg flex items-center justify-between">
-                <span>Tickets & Passes</span>
+                <span>Select Tickets</span>
                 <Ticket className="h-5 w-5 text-primary" />
               </CardTitle>
+              <CardDescription className="text-xs">
+                Select quantities for your desired passes
+              </CardDescription>
             </CardHeader>
 
             <CardContent className="space-y-4">
@@ -241,20 +446,23 @@ export function EventDetailPage() {
                 <div className="space-y-3">
                   {tiers.map((tier) => {
                     const isAvailable = tier.available_quantity > 0 && tier.is_active
+                    const maxAllowed = Math.min(tier.max_per_user, tier.available_quantity)
+                    const currentQty = selectedQuantities[tier.id] || 0
+
                     return (
                       <div
                         key={tier.id}
-                        className="rounded-lg border p-3 hover:border-primary/50 transition-colors space-y-2 bg-muted/20"
+                        className="rounded-lg border p-3.5 hover:border-primary/40 transition-colors space-y-2 bg-muted/20"
                       >
                         <div className="flex items-start justify-between">
                           <div>
                             <h4 className="font-semibold text-sm">{tier.name}</h4>
                             {tier.description && (
-                              <p className="text-xs text-muted-foreground">{tier.description}</p>
+                              <p className="text-xs text-muted-foreground line-clamp-1">{tier.description}</p>
                             )}
                           </div>
                           <span className="font-bold text-sm text-primary">
-                            {formatCurrency(tier.price)}
+                            {Number(tier.price) === 0 ? 'Free' : formatCurrency(tier.price)}
                           </span>
                         </div>
 
@@ -265,24 +473,79 @@ export function EventDetailPage() {
                           <span className="text-[11px]">Max {tier.max_per_user} / user</span>
                         </div>
 
-                        <Button
-                          size="sm"
-                          className="w-full mt-2"
-                          disabled={!isAvailable}
-                          onClick={() => handleBookTicket(tier)}
-                        >
-                          {isAvailable ? 'Select Ticket' : 'Sold Out'}
-                        </Button>
+                        {/* Quantity Stepper */}
+                        {isAvailable ? (
+                          <div className="flex items-center justify-between pt-2 border-t mt-2">
+                            <span className="text-xs font-medium">Quantity</span>
+                            <div className="flex items-center gap-2">
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="icon"
+                                className="h-7 w-7 rounded-md"
+                                disabled={currentQty === 0 || isBooking}
+                                onClick={() => handleQuantityChange(tier.id, -1, maxAllowed)}
+                              >
+                                <Minus className="h-3 w-3" />
+                              </Button>
+                              <span className="w-6 text-center text-sm font-semibold">{currentQty}</span>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="icon"
+                                className="h-7 w-7 rounded-md"
+                                disabled={currentQty >= maxAllowed || isBooking}
+                                onClick={() => handleQuantityChange(tier.id, 1, maxAllowed)}
+                              >
+                                <Plus className="h-3 w-3" />
+                              </Button>
+                            </div>
+                          </div>
+                        ) : (
+                          <Badge variant="secondary" className="w-full justify-center mt-2 text-xs py-1">
+                            Sold Out
+                          </Badge>
+                        )}
                       </div>
                     )
                   })}
+
+                  {/* Summary & Booking Button */}
+                  <div className="pt-3 border-t space-y-3">
+                    <div className="flex items-center justify-between text-sm font-semibold">
+                      <span>Total ({totalTicketsSelected} {totalTicketsSelected === 1 ? 'ticket' : 'tickets'}):</span>
+                      <span className="text-base text-primary">
+                        {totalCost === 0 ? 'Free' : formatCurrency(totalCost)}
+                      </span>
+                    </div>
+
+                    <Button
+                      className="w-full font-semibold shadow-sm"
+                      disabled={totalTicketsSelected === 0 || isBooking || isOrganizerOfThisEvent}
+                      onClick={handleCreateBooking}
+                    >
+                      {isBooking ? (
+                        <>
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          Processing Booking...
+                        </>
+                      ) : isOrganizerOfThisEvent ? (
+                        'You are the Organizer'
+                      ) : totalCost === 0 ? (
+                        `Confirm Free Registration (${totalTicketsSelected})`
+                      ) : (
+                        `Book Tickets (${formatCurrency(totalCost)})`
+                      )}
+                    </Button>
+
+                    <p className="text-[11px] text-muted-foreground text-center">
+                      Instant digital QR pass generation. Zero booking fees.
+                    </p>
+                  </div>
                 </div>
               ) : (
                 <div className="text-center py-6 space-y-3">
-                  <p className="text-sm text-muted-foreground">General Admission is free for this event.</p>
-                  <Button className="w-full" onClick={() => handleBookTicket()}>
-                    Register for Free
-                  </Button>
+                  <p className="text-sm text-muted-foreground">No active ticket tiers configured yet.</p>
                 </div>
               )}
             </CardContent>
@@ -290,43 +553,111 @@ export function EventDetailPage() {
         </div>
       </div>
 
-      {/* Booking Dialog Modal (Coming Soon in 70% milestone) */}
-      <Dialog open={bookingModalOpen} onOpenChange={setBookingModalOpen}>
+      {/* Volunteer Application Dialog */}
+      <Dialog open={volunteerModalOpen} onOpenChange={setVolunteerModalOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
-              <Ticket className="h-5 w-5 text-primary" />
-              Book Tickets: {event.title}
+              <HeartHandshake className="h-5 w-5 text-indigo-600" />
+              Apply as Volunteer Staff
             </DialogTitle>
             <DialogDescription>
-              {selectedTier ? `Selected tier: ${selectedTier.name} (${formatCurrency(selectedTier.price)})` : 'Free Registration'}
+              Submit your motivation to the event organizer to join the gate check-in & event team.
             </DialogDescription>
           </DialogHeader>
 
-          <div className="py-4 space-y-4">
-            <div className="rounded-lg bg-primary/10 border border-primary/20 p-4 space-y-2 text-center">
-              <Clock className="h-8 w-8 text-primary mx-auto" />
-              <h4 className="font-semibold text-foreground">Online Booking Gateway</h4>
-              <p className="text-xs text-muted-foreground">
-                Payment gateway integration (bKash, Nagad, card) and automated QR ticket issuance will be activated in the next project release (70% milestone).
-              </p>
+          <form onSubmit={handleVolunteerApply} className="space-y-4 py-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="motivation">Motivation & Experience *</Label>
+              <Textarea
+                id="motivation"
+                placeholder="Why would you like to volunteer for this event? Mention your availability or past experience."
+                rows={4}
+                value={volunteerMotivation}
+                onChange={(e) => setVolunteerMotivation(e.target.value)}
+                required
+              />
             </div>
 
-            <div className="space-y-2 text-xs text-muted-foreground border-t pt-3">
-              <div className="flex items-center gap-1.5">
-                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
-                <span>Instant confirmation and QR pass generation</span>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setVolunteerModalOpen(false)}
+                disabled={isSubmittingVolunteer}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={isSubmittingVolunteer || !volunteerMotivation.trim()}>
+                {isSubmittingVolunteer ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Submitting...
+                  </>
+                ) : (
+                  'Submit Application'
+                )}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+
+      {/* Booking Confirmation Dialog */}
+      <Dialog open={bookingSuccessModalOpen} onOpenChange={setBookingSuccessModalOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-600 mb-2">
+              <CheckCircle2 className="h-8 w-8" />
+            </div>
+            <DialogTitle className="text-center text-xl">Booking Confirmed!</DialogTitle>
+            <DialogDescription className="text-center">
+              Your tickets for <strong className="text-foreground">{event.title}</strong> have been confirmed and issued with cryptographic QR passes.
+            </DialogDescription>
+          </DialogHeader>
+
+          {confirmedBooking && (
+            <div className="p-4 bg-muted/40 rounded-xl space-y-2 text-xs border">
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Booking ID:</span>
+                <span className="font-mono font-medium">{confirmedBooking.id.slice(0, 13)}...</span>
               </div>
-              <div className="flex items-center gap-1.5">
-                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
-                <span>Access your digital passes under My Tickets anytime</span>
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Total Tickets:</span>
+                <span className="font-semibold">
+                  {confirmedBooking.items.reduce((acc, it) => acc + it.quantity, 0)}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Total Amount:</span>
+                <span className="font-semibold text-primary">
+                  {Number(confirmedBooking.total_amount) === 0
+                    ? 'Free'
+                    : formatCurrency(confirmedBooking.total_amount)}
+                </span>
               </div>
             </div>
+          )}
+
+          <div className="space-y-2 pt-2">
+            <Button
+              className="w-full gap-1.5"
+              onClick={() => {
+                setBookingSuccessModalOpen(false)
+                navigate('/my-bookings')
+              }}
+            >
+              <Ticket className="h-4 w-4" />
+              View My Bookings & Passes
+            </Button>
+            <Button
+              variant="outline"
+              className="w-full"
+              onClick={() => setBookingSuccessModalOpen(false)}
+            >
+              Continue Browsing
+            </Button>
           </div>
-
-          <Button onClick={() => setBookingModalOpen(false)} className="w-full">
-            Understood
-          </Button>
         </DialogContent>
       </Dialog>
     </div>

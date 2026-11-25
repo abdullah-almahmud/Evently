@@ -71,6 +71,12 @@ class StaffRole(str, Enum):
     COORDINATOR = "COORDINATOR"
 
 
+class VolunteerApplicationStatus(str, Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+
+
 # Import models so Alembic and SQLAlchemy can discover them
 from app.models.user import User, OrganizerRequest
 from app.models.venue import Venue, VenueSection
@@ -82,6 +88,7 @@ from app.models.ticket import Ticket
 from app.models.staff import EventStaff
 from app.models.resource import Resource, ResourceBooking
 from app.models.waitlist import EventWaitlist
+from app.models.volunteer import VolunteerApplication
 
 __all__ = [
     # Enums
@@ -96,6 +103,7 @@ __all__ = [
     "PaymentStatus",
     "PaymentGateway",
     "StaffRole",
+    "VolunteerApplicationStatus",
     # Models
     "User",
     "OrganizerRequest",
@@ -113,4 +121,5 @@ __all__ = [
     "Resource",
     "ResourceBooking",
     "EventWaitlist",
+    "VolunteerApplication",
 ]

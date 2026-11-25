@@ -1,4 +1,7 @@
+import logging
 import math
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import List, Optional
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -6,9 +9,22 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from app.core.database import get_db
-from app.core.deps import get_current_organizer, get_current_user, oauth2_scheme
+from app.core.deps import get_current_active_user, get_current_organizer, get_current_user, oauth2_scheme
 from app.core.security import decode_token
-from app.models import BookingItem, Event, EventCategory, EventStatus, TicketTier, User, UserRole, Venue
+from app.models import (
+    BookingItem,
+    Event,
+    EventCategory,
+    EventStaff,
+    EventStatus,
+    StaffRole,
+    TicketTier,
+    User,
+    UserRole,
+    Venue,
+    VolunteerApplication,
+    VolunteerApplicationStatus,
+)
 from app.schemas.event import (
     EventCreate,
     EventListResponse,
@@ -18,6 +34,15 @@ from app.schemas.event import (
     TicketTierResponse,
     TicketTierUpdate,
 )
+from app.schemas.staff import (
+    StaffResponse,
+    VolunteerApplicationCreate,
+    VolunteerApplicationResponse,
+    VolunteerApplicationReview,
+)
+from app.schemas.user import UserResponse
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -510,3 +535,215 @@ async def delete_ticket_tier(
     await db.delete(tier)
     await db.commit()
     return {"message": "Ticket tier deleted successfully"}
+
+
+# ─── Volunteer Application Routes ─────────────────────────────────────────────
+
+@router.post("/{event_id}/volunteer-apply", response_model=VolunteerApplicationResponse, status_code=status.HTTP_201_CREATED)
+async def apply_as_volunteer(
+    event_id: UUID,
+    data: VolunteerApplicationCreate,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> VolunteerApplicationResponse:
+    """Any authenticated user can apply to volunteer for an event."""
+    # Verify event exists
+    event_res = await db.execute(select(Event).where(Event.id == event_id))
+    event = event_res.scalar_one_or_none()
+    if not event:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+
+    # Check for duplicate application
+    existing_res = await db.execute(
+        select(VolunteerApplication).where(
+            VolunteerApplication.event_id == event_id,
+            VolunteerApplication.user_id == current_user.id,
+        )
+    )
+    existing = existing_res.scalar_one_or_none()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You have already applied to volunteer for this event",
+        )
+
+    application = VolunteerApplication(
+        event_id=event_id,
+        user_id=current_user.id,
+        motivation=data.motivation,
+        status=VolunteerApplicationStatus.PENDING,
+    )
+    db.add(application)
+    await db.commit()
+    await db.refresh(application)
+
+    # Reload with user
+    app_res = await db.execute(
+        select(VolunteerApplication)
+        .where(VolunteerApplication.id == application.id)
+        .options(selectinload(VolunteerApplication.user))
+    )
+    loaded = app_res.scalar_one()
+    return VolunteerApplicationResponse.model_validate(loaded)
+
+
+@router.get("/{event_id}/volunteer-applications", response_model=List[VolunteerApplicationResponse])
+async def list_volunteer_applications(
+    event_id: UUID,
+    current_user: User = Depends(get_current_organizer),
+    db: AsyncSession = Depends(get_db),
+) -> List[VolunteerApplicationResponse]:
+    """Organizer only: list all volunteer applications for their event."""
+    event_res = await db.execute(select(Event).where(Event.id == event_id))
+    event = event_res.scalar_one_or_none()
+    if not event:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+
+    if event.organizer_id != current_user.id and current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    result = await db.execute(
+        select(VolunteerApplication)
+        .where(VolunteerApplication.event_id == event_id)
+        .options(selectinload(VolunteerApplication.user))
+        .order_by(VolunteerApplication.created_at.desc())
+    )
+    apps = result.scalars().all()
+    return [VolunteerApplicationResponse.model_validate(a) for a in apps]
+
+
+@router.post("/{event_id}/volunteer-applications/{app_id}/review", response_model=VolunteerApplicationResponse)
+async def review_volunteer_application(
+    event_id: UUID,
+    app_id: UUID,
+    data: VolunteerApplicationReview,
+    current_user: User = Depends(get_current_organizer),
+    db: AsyncSession = Depends(get_db),
+) -> VolunteerApplicationResponse:
+    """Organizer only: approve or reject a volunteer application. On APPROVED, auto-create EventStaff."""
+    event_res = await db.execute(select(Event).where(Event.id == event_id))
+    event = event_res.scalar_one_or_none()
+    if not event:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+
+    if event.organizer_id != current_user.id and current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    app_res = await db.execute(
+        select(VolunteerApplication)
+        .where(VolunteerApplication.id == app_id, VolunteerApplication.event_id == event_id)
+        .options(selectinload(VolunteerApplication.user))
+    )
+    application = app_res.scalar_one_or_none()
+    if not application:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Volunteer application not found")
+
+    application.status = data.status
+    application.reviewed_by = current_user.id
+    application.reviewed_at = datetime.now(timezone.utc)
+
+    # On approval: create EventStaff record if not already exists
+    if data.status == VolunteerApplicationStatus.APPROVED:
+        existing_staff_res = await db.execute(
+            select(EventStaff).where(
+                EventStaff.event_id == event_id,
+                EventStaff.user_id == application.user_id,
+            )
+        )
+        existing_staff = existing_staff_res.scalar_one_or_none()
+        if not existing_staff:
+            staff = EventStaff(
+                user_id=application.user_id,
+                event_id=event_id,
+                role=StaffRole.GATE_STAFF,
+                assigned_by=current_user.id,
+            )
+            db.add(staff)
+
+    await db.commit()
+
+    # Reload with user
+    app_reload_res = await db.execute(
+        select(VolunteerApplication)
+        .where(VolunteerApplication.id == application.id)
+        .options(selectinload(VolunteerApplication.user))
+    )
+    loaded = app_reload_res.scalar_one()
+    return VolunteerApplicationResponse.model_validate(loaded)
+
+
+@router.get("/{event_id}/my-volunteer-status", response_model=VolunteerApplicationResponse)
+async def get_my_volunteer_status(
+    event_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> VolunteerApplicationResponse:
+    """Authenticated user: check their own volunteer application status for this event."""
+    app_res = await db.execute(
+        select(VolunteerApplication)
+        .where(
+            VolunteerApplication.event_id == event_id,
+            VolunteerApplication.user_id == current_user.id,
+        )
+        .options(selectinload(VolunteerApplication.user))
+    )
+    application = app_res.scalar_one_or_none()
+    if not application:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No volunteer application found for this event")
+
+    return VolunteerApplicationResponse.model_validate(application)
+
+
+# ─── Event Staff Listing ───────────────────────────────────────────────────────
+
+@router.get("/{event_id}/staff", response_model=List[StaffResponse])
+async def list_event_staff(
+    event_id: UUID,
+    current_user: User = Depends(get_current_organizer),
+    db: AsyncSession = Depends(get_db),
+) -> List[StaffResponse]:
+    """Organizer only: list all staff assigned to an event."""
+    event_res = await db.execute(select(Event).where(Event.id == event_id))
+    event = event_res.scalar_one_or_none()
+    if not event:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+
+    if event.organizer_id != current_user.id and current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    result = await db.execute(
+        select(EventStaff)
+        .where(EventStaff.event_id == event_id)
+        .options(selectinload(EventStaff.user))
+        .order_by(EventStaff.created_at.asc())
+    )
+    staff_list = result.scalars().all()
+    return [StaffResponse.model_validate(s) for s in staff_list]
+
+
+@router.delete("/{event_id}/staff/{staff_id}", status_code=status.HTTP_200_OK)
+async def remove_event_staff(
+    event_id: UUID,
+    staff_id: UUID,
+    current_user: User = Depends(get_current_organizer),
+    db: AsyncSession = Depends(get_db),
+):
+    """Organizer only: remove a staff assignment from an event."""
+    event_res = await db.execute(select(Event).where(Event.id == event_id))
+    event = event_res.scalar_one_or_none()
+    if not event:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+
+    if event.organizer_id != current_user.id and current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    staff_res = await db.execute(
+        select(EventStaff).where(EventStaff.id == staff_id, EventStaff.event_id == event_id)
+    )
+    staff = staff_res.scalar_one_or_none()
+    if not staff:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Staff assignment not found")
+
+    await db.delete(staff)
+    await db.commit()
+    return {"message": "Staff assignment removed successfully"}

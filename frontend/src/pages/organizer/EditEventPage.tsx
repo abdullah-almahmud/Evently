@@ -1,6 +1,6 @@
 import { useState, useEffect, FormEvent } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { ChevronLeft, Plus, Trash2, Loader2, Pencil } from 'lucide-react'
+import { ChevronLeft, Plus, Trash2, Loader2, Pencil, Users, UserCheck, BarChart3 } from 'lucide-react'
 import { EventCategory, Venue, TicketTier } from '@/types'
 import { eventsApi, venuesApi } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -266,11 +266,34 @@ export function EditEventPage() {
         </Button>
       </div>
 
-      <div>
-        <h1 className="text-3xl font-bold tracking-tight">Edit Event</h1>
-        <p className="text-muted-foreground text-sm">
-          Update event details, timing, or manage ticket allocations.
-        </p>
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <h1 className="text-3xl font-bold tracking-tight">Edit Event</h1>
+          <p className="text-muted-foreground text-sm">
+            Update event details, timing, or manage ticket allocations.
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2 flex-wrap">
+          <Button variant="outline" size="sm" asChild className="gap-1.5">
+            <Link to={`/organizer/events/${id}/staff`}>
+              <Users className="h-4 w-4 text-primary" />
+              Event Staff
+            </Link>
+          </Button>
+          <Button variant="outline" size="sm" asChild className="gap-1.5">
+            <Link to={`/organizer/events/${id}/volunteers`}>
+              <UserCheck className="h-4 w-4 text-emerald-600" />
+              Volunteers
+            </Link>
+          </Button>
+          <Button variant="outline" size="sm" asChild className="gap-1.5">
+            <Link to={`/organizer/events/${id}/analytics`}>
+              <BarChart3 className="h-4 w-4 text-indigo-600" />
+              Analytics
+            </Link>
+          </Button>
+        </div>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-8">

@@ -77,6 +77,12 @@ class User(Base):
     )
     staff_assignments = relationship("EventStaff", back_populates="user", foreign_keys="EventStaff.user_id")
     waitlists = relationship("EventWaitlist", back_populates="user", cascade="all, delete-orphan")
+    volunteer_applications = relationship(
+        "VolunteerApplication",
+        back_populates="user",
+        foreign_keys="VolunteerApplication.user_id",
+        cascade="all, delete-orphan",
+    )
 
 
 class OrganizerRequest(Base):

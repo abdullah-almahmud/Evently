@@ -25,8 +25,19 @@ const GoogleCallbackPage = lazy(() =>
 const MyTicketsPage = lazy(() =>
   import('@/pages/tickets/MyTicketsPage').then((m) => ({ default: m.MyTicketsPage }))
 )
+const MyBookingsPage = lazy(() =>
+  import('@/pages/tickets/MyBookingsPage').then((m) => ({ default: m.MyBookingsPage }))
+)
 const ProfilePage = lazy(() =>
   import('@/pages/profile/ProfilePage').then((m) => ({ default: m.ProfilePage }))
+)
+
+// Staff Pages
+const StaffEventsPage = lazy(() =>
+  import('@/pages/staff/StaffEventsPage').then((m) => ({ default: m.StaffEventsPage }))
+)
+const GateDashboardPage = lazy(() =>
+  import('@/pages/staff/GateDashboardPage').then((m) => ({ default: m.GateDashboardPage }))
 )
 
 // Organizer Pages
@@ -41,6 +52,12 @@ const EditEventPage = lazy(() =>
 )
 const EventAnalyticsPage = lazy(() =>
   import('@/pages/organizer/EventAnalyticsPage').then((m) => ({ default: m.EventAnalyticsPage }))
+)
+const EventStaffPage = lazy(() =>
+  import('@/pages/organizer/EventStaffPage').then((m) => ({ default: m.EventStaffPage }))
+)
+const VolunteerApplicationsPage = lazy(() =>
+  import('@/pages/organizer/VolunteerApplicationsPage').then((m) => ({ default: m.VolunteerApplicationsPage }))
 )
 const VenuesPage = lazy(() =>
   import('@/pages/organizer/VenuesPage').then((m) => ({ default: m.VenuesPage }))
@@ -135,10 +152,36 @@ const router = createBrowserRouter([
         ),
       },
       {
+        path: 'my-bookings',
+        element: (
+          <ProtectedRoute>
+            <MyBookingsPage />
+          </ProtectedRoute>
+        ),
+      },
+      {
         path: 'profile',
         element: (
           <ProtectedRoute>
             <ProfilePage />
+          </ProtectedRoute>
+        ),
+      },
+
+      // Staff routes
+      {
+        path: 'staff/events',
+        element: (
+          <ProtectedRoute>
+            <StaffEventsPage />
+          </ProtectedRoute>
+        ),
+      },
+      {
+        path: 'staff/gate/:eventId',
+        element: (
+          <ProtectedRoute>
+            <GateDashboardPage />
           </ProtectedRoute>
         ),
       },
@@ -173,6 +216,22 @@ const router = createBrowserRouter([
         element: (
           <ProtectedRoute requiredRole={['ORGANIZER', 'ADMIN']}>
             <EventAnalyticsPage />
+          </ProtectedRoute>
+        ),
+      },
+      {
+        path: 'organizer/events/:id/staff',
+        element: (
+          <ProtectedRoute requiredRole={['ORGANIZER', 'ADMIN']}>
+            <EventStaffPage />
+          </ProtectedRoute>
+        ),
+      },
+      {
+        path: 'organizer/events/:id/volunteers',
+        element: (
+          <ProtectedRoute requiredRole={['ORGANIZER', 'ADMIN']}>
+            <VolunteerApplicationsPage />
           </ProtectedRoute>
         ),
       },

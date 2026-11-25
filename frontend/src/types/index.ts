@@ -12,6 +12,8 @@ export type LayoutType = 'SEATED' | 'GENERAL_ADMISSION'
 export type BookingStatus = 'PENDING' | 'CONFIRMED' | 'CANCELLED' | 'REFUNDED'
 export type TicketStatus = 'ACTIVE' | 'USED' | 'CANCELLED'
 export type OrganizerRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED'
+export type VolunteerApplicationStatus = 'PENDING' | 'APPROVED' | 'REJECTED'
+export type StaffRole = 'GATE_STAFF' | 'COORDINATOR'
 
 export interface User {
   id: string
@@ -98,11 +100,22 @@ export interface Ticket {
   id: string
   event_id: string
   tier_id: string
+  user_id: string
   seat_id?: string | null
   qr_code: string
   status: TicketStatus
   checked_in_at?: string | null
+  created_at: string
   event?: Event
+  tier?: TicketTier
+}
+
+export interface BookingItem {
+  id: string
+  tier_id: string
+  seat_id?: string | null
+  quantity: number
+  unit_price: number
   tier?: TicketTier
 }
 
@@ -113,8 +126,63 @@ export interface Booking {
   total_amount: number
   status: BookingStatus
   created_at: string
-  tickets?: Ticket[]
+  updated_at?: string
+  items: BookingItem[]
   event?: Event
+}
+
+export interface BookingCreateItem {
+  tier_id: string
+  quantity: number
+}
+
+export interface CreateBookingRequest {
+  event_id: string
+  items: BookingCreateItem[]
+}
+
+export interface VolunteerApplication {
+  id: string
+  event_id: string
+  user_id: string
+  motivation: string
+  status: VolunteerApplicationStatus
+  reviewed_by?: string | null
+  reviewed_at?: string | null
+  created_at: string
+  user?: User
+}
+
+export interface EventStaff {
+  id: string
+  event_id: string
+  user_id: string
+  role: StaffRole
+  assigned_by: string
+  created_at: string
+  user?: User
+}
+
+export interface CheckInResult {
+  valid: boolean
+  message: string
+  ticket?: Ticket
+  attendee_name?: string
+}
+
+export interface CheckInStats {
+  total_tickets: number
+  checked_in: number
+  remaining: number
+}
+
+export interface CheckInTicketItem {
+  ticket_id: string
+  user_id: string
+  attendee_name: string
+  tier_name: string
+  status: TicketStatus
+  checked_in_at?: string | null
 }
 
 export interface PaginatedResponse<T> {

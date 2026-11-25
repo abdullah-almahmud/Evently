@@ -15,12 +15,13 @@ import {
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
-import { eventsApi } from '@/lib/api'
-import type { Event, TicketTier } from '@/types'
+import { eventsApi, bookingsApi } from '@/lib/api'
+import type { Event, TicketTier, Booking } from '@/types'
 
 export function EventAnalyticsPage() {
   const { id } = useParams<{ id: string }>()
   const [event, setEvent] = useState<Event | null>(null)
+  const [bookings, setBookings] = useState<Booking[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -31,8 +32,12 @@ export function EventAnalyticsPage() {
       try {
         setLoading(true)
         setError(null)
-        const data = await eventsApi.getEvent(id)
-        setEvent(data)
+        const [eventData, bookingsData] = await Promise.all([
+          eventsApi.getEvent(id),
+          bookingsApi.getEventBookings(id).catch(() => []),
+        ])
+        setEvent(eventData)
+        setBookings(bookingsData || [])
       } catch (err: unknown) {
         console.error('Failed to load event data for analytics:', err)
         setError('Unable to load event details. Please verify the event exists and you have permission.')
@@ -260,6 +265,84 @@ export function EventAnalyticsPage() {
                         <td className="py-3 px-4">
                           <Badge variant={tier.is_active ? 'default' : 'secondary'} className="text-[10px] px-2 py-0.5">
                             {tier.is_active ? 'Active' : 'Inactive'}
+                          </Badge>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Recent Bookings Table */}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle className="text-lg">Event Bookings & Orders</CardTitle>
+              <CardDescription>Attendee booking orders placed for this event</CardDescription>
+            </div>
+            <Badge variant="outline">{bookings.length} Order{bookings.length !== 1 ? 's' : ''}</Badge>
+          </div>
+        </CardHeader>
+        <CardContent>
+          {bookings.length === 0 ? (
+            <div className="text-center py-8 text-muted-foreground text-sm">
+              No ticket orders have been placed for this event yet.
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm text-left">
+                <thead className="text-xs uppercase text-muted-foreground border-b">
+                  <tr>
+                    <th className="py-3 px-4">Booking ID</th>
+                    <th className="py-3 px-4">Date & Time</th>
+                    <th className="py-3 px-4">Tickets</th>
+                    <th className="py-3 px-4">Total Amount</th>
+                    <th className="py-3 px-4">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y">
+                  {bookings.map((booking) => {
+                    const ticketCount = booking.items?.reduce((acc, it) => acc + it.quantity, 0) || 0
+                    return (
+                      <tr key={booking.id} className="hover:bg-muted/40 transition-colors">
+                        <td className="py-3 px-4 font-mono text-xs font-semibold">
+                          {booking.id.slice(0, 13)}...
+                        </td>
+                        <td className="py-3 px-4 text-xs text-muted-foreground">
+                          {new Date(booking.created_at).toLocaleString(undefined, {
+                            month: 'short',
+                            day: 'numeric',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}
+                        </td>
+                        <td className="py-3 px-4">{ticketCount} {ticketCount === 1 ? 'ticket' : 'tickets'}</td>
+                        <td className="py-3 px-4 font-semibold">
+                          {Number(booking.total_amount) === 0 ? (
+                            <Badge variant="secondary" className="bg-emerald-500/10 text-emerald-600 border-0">
+                              Free
+                            </Badge>
+                          ) : (
+                            `৳${Number(booking.total_amount).toLocaleString()}`
+                          )}
+                        </td>
+                        <td className="py-3 px-4">
+                          <Badge
+                            variant={
+                              booking.status === 'CONFIRMED'
+                                ? 'default'
+                                : booking.status === 'CANCELLED'
+                                ? 'destructive'
+                                : 'secondary'
+                            }
+                            className="text-[10px] px-2 py-0.5"
+                          >
+                            {booking.status}
                           </Badge>
                         </td>
                       </tr>
