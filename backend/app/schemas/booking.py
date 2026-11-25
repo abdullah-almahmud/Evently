@@ -4,7 +4,7 @@ from typing import List, Optional
 from uuid import UUID
 from pydantic import BaseModel, ConfigDict
 from app.models import BookingStatus
-from app.schemas.ticket import TicketResponse
+from app.schemas.ticket import TicketEventSummary, TicketResponse, TicketTierSummary
 
 
 class BookingCreateItem(BaseModel):
@@ -26,6 +26,7 @@ class BookingItemResponse(BaseModel):
     seat_id: Optional[UUID] = None
     quantity: int
     unit_price: Decimal
+    tier: Optional[TicketTierSummary] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -41,5 +42,6 @@ class BookingResponse(BaseModel):
     updated_at: Optional[datetime] = None
     items: List[BookingItemResponse] = []
     tickets: Optional[List[TicketResponse]] = None
+    event: Optional[TicketEventSummary] = None
 
     model_config = ConfigDict(from_attributes=True)

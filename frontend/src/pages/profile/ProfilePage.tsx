@@ -77,8 +77,8 @@ export function ProfilePage() {
 
   const handleSubmitOrganizerRequest = async (e: FormEvent) => {
     e.preventDefault()
-    if (!requestReason.trim()) {
-      toast.error('Please specify the reason and club/department affiliation.')
+    if (requestReason.trim().length < 10) {
+      toast.error('Please enter at least 10 characters describing your club/department affiliation.')
       return
     }
 
@@ -229,6 +229,21 @@ export function ProfilePage() {
                   <p className="text-xs text-amber-600 dark:text-amber-400">
                     Your request is in the admin queue. You will receive organizer permissions once verified.
                   </p>
+                )}
+
+                {organizerRequest.status === 'REJECTED' && (
+                  <div className="pt-2 flex items-center justify-between gap-2">
+                    <p className="text-xs text-muted-foreground">
+                      Your previous application was declined. You may submit an updated application.
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => setOrganizerRequest(null)}
+                    >
+                      Reapply
+                    </Button>
+                  </div>
                 )}
               </div>
             ) : (

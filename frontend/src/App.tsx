@@ -76,6 +76,9 @@ const OrganizerRequestsPage = lazy(() =>
 const AdminUsersPage = lazy(() =>
   import('@/pages/admin/AdminUsersPage').then((m) => ({ default: m.AdminUsersPage }))
 )
+const AdminEventsPage = lazy(() =>
+  import('@/pages/admin/AdminEventsPage').then((m) => ({ default: m.AdminEventsPage }))
+)
 
 function PageLoader() {
   return (
@@ -146,7 +149,7 @@ const router = createBrowserRouter([
       {
         path: 'tickets',
         element: (
-          <ProtectedRoute>
+          <ProtectedRoute disallowedRole="ADMIN">
             <MyTicketsPage />
           </ProtectedRoute>
         ),
@@ -154,7 +157,7 @@ const router = createBrowserRouter([
       {
         path: 'my-bookings',
         element: (
-          <ProtectedRoute>
+          <ProtectedRoute disallowedRole="ADMIN">
             <MyBookingsPage />
           </ProtectedRoute>
         ),
@@ -172,7 +175,7 @@ const router = createBrowserRouter([
       {
         path: 'staff/events',
         element: (
-          <ProtectedRoute>
+          <ProtectedRoute requireStaff>
             <StaffEventsPage />
           </ProtectedRoute>
         ),
@@ -180,7 +183,7 @@ const router = createBrowserRouter([
       {
         path: 'staff/gate/:eventId',
         element: (
-          <ProtectedRoute>
+          <ProtectedRoute requireStaff>
             <GateDashboardPage />
           </ProtectedRoute>
         ),
@@ -274,6 +277,14 @@ const router = createBrowserRouter([
         element: (
           <ProtectedRoute requiredRole="ADMIN">
             <AdminUsersPage />
+          </ProtectedRoute>
+        ),
+      },
+      {
+        path: 'admin/events',
+        element: (
+          <ProtectedRoute requiredRole="ADMIN">
+            <AdminEventsPage />
           </ProtectedRoute>
         ),
       },

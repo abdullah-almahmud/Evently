@@ -1,8 +1,39 @@
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 from pydantic import BaseModel, ConfigDict
 from app.models import TicketStatus
+
+
+class TicketVenueSummary(BaseModel):
+    """Minimal venue info nested on ticket/booking event summary."""
+    id: UUID
+    name: str
+    address: Optional[str] = None
+    city: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TicketEventSummary(BaseModel):
+    """Minimal event info nested on tickets and bookings."""
+    id: UUID
+    title: str
+    start_datetime: datetime
+    end_datetime: datetime
+    venue: Optional[TicketVenueSummary] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TicketTierSummary(BaseModel):
+    """Minimal tier info nested on tickets and booking items."""
+    id: UUID
+    name: str
+    price: Decimal
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class TicketResponse(BaseModel):
@@ -16,6 +47,8 @@ class TicketResponse(BaseModel):
     status: TicketStatus
     checked_in_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
+    event: Optional[TicketEventSummary] = None
+    tier: Optional[TicketTierSummary] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -44,6 +77,7 @@ class CheckInStatsResponse(BaseModel):
 class CheckInTicketListItem(BaseModel):
     """Ticket list item for organizer/staff view."""
     id: UUID
+    ticket_id: UUID
     user_id: UUID
     attendee_name: str
     attendee_email: str

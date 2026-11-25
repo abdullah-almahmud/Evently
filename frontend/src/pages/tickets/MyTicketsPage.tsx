@@ -1,8 +1,18 @@
 import { useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
-import { Ticket as TicketIcon, Calendar, QrCode, Sparkles, MapPin, Compass } from 'lucide-react'
+import {
+  Ticket as TicketIcon,
+  Calendar,
+  QrCode,
+  MapPin,
+  Compass,
+  Copy,
+  ShoppingBag,
+  CheckCircle2,
+  XCircle,
+} from 'lucide-react'
 import QRCode from 'react-qr-code'
-import { Ticket } from '@/types'
+import { Ticket, TicketStatus } from '@/types'
 import { ticketsApi } from '@/lib/api'
 import { formatDate } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -16,6 +26,30 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { toast } from 'sonner'
+
+function getTicketStatusBadge(status: TicketStatus) {
+  switch (status) {
+    case 'ACTIVE':
+      return (
+        <Badge className="bg-emerald-600 hover:bg-emerald-700 gap-1">
+          <CheckCircle2 className="h-3 w-3" />
+          Active Pass
+        </Badge>
+      )
+    case 'USED':
+      return <Badge variant="secondary">Checked In</Badge>
+    case 'CANCELLED':
+      return (
+        <Badge variant="destructive" className="gap-1">
+          <XCircle className="h-3 w-3" />
+          Cancelled
+        </Badge>
+      )
+    default:
+      return <Badge variant="outline">{status}</Badge>
+  }
+}
 
 export function MyTicketsPage() {
   const [tickets, setTickets] = useState<Ticket[]>([])
@@ -38,26 +72,27 @@ export function MyTicketsPage() {
     fetchTickets()
   }, [])
 
+  const handleCopyQr = (qrValue: string) => {
+    navigator.clipboard.writeText(qrValue)
+    toast.success('QR pass token copied to clipboard!')
+  }
+
   return (
     <div className="container mx-auto px-4 py-8 max-w-4xl space-y-6">
-      <div>
-        <h1 className="text-3xl font-bold tracking-tight">My Tickets & Passes</h1>
-        <p className="text-muted-foreground text-sm">
-          Access your digital admission passes, QR codes for venue check-in, and purchase receipts.
-        </p>
-      </div>
-
-      {/* Release Notice Banner */}
-      <div className="rounded-xl border border-primary/20 bg-primary/5 p-4 flex items-start gap-3">
-        <Sparkles className="h-5 w-5 text-primary shrink-0 mt-0.5" />
-        <div className="text-xs text-muted-foreground space-y-1">
-          <p className="font-semibold text-foreground text-sm">
-            Live Ticket Booking System Integration
-          </p>
-          <p>
-            Ticket booking and automated QR check-in will be fully active in the upcoming release. Your registered passes and event tickets will automatically appear here.
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <h1 className="text-3xl font-bold tracking-tight">My Tickets & Passes</h1>
+          <p className="text-muted-foreground text-sm">
+            Present your individual digital entry passes and QR codes at the venue gate.
           </p>
         </div>
+
+        <Button variant="outline" size="sm" asChild className="gap-1.5 self-start sm:self-auto">
+          <Link to="/my-bookings">
+            <ShoppingBag className="h-4 w-4" />
+            Manage Orders & Cancellations
+          </Link>
+        </Button>
       </div>
 
       {isLoading ? (
@@ -95,9 +130,7 @@ export function MyTicketsPage() {
               <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between p-6 gap-4">
                 <div className="space-y-2">
                   <div className="flex items-center gap-2">
-                    <Badge variant={ticket.status === 'ACTIVE' ? 'default' : 'secondary'}>
-                      {ticket.status}
-                    </Badge>
+                    {getTicketStatusBadge(ticket.status)}
                     <span className="text-xs text-muted-foreground font-mono">
                       #{ticket.id.slice(0, 8)}
                     </span>
@@ -129,15 +162,22 @@ export function MyTicketsPage() {
                       </span>
                     </div>
                   </div>
+
+                  {ticket.checked_in_at && (
+                    <p className="text-xs text-emerald-600 dark:text-emerald-400">
+                      Checked in on {new Date(ticket.checked_in_at).toLocaleString()}
+                    </p>
+                  )}
                 </div>
 
                 <Button
-                  variant="outline"
+                  variant={ticket.status === 'ACTIVE' ? 'default' : 'outline'}
+                  disabled={ticket.status === 'CANCELLED'}
                   onClick={() => setSelectedTicket(ticket)}
                   className="gap-2 shrink-0"
                 >
                   <QrCode className="h-4 w-4" />
-                  Show QR Pass
+                  {ticket.status === 'CANCELLED' ? 'Voided' : 'Show QR Pass'}
                 </Button>
               </div>
             </Card>
@@ -151,7 +191,7 @@ export function MyTicketsPage() {
           <DialogHeader>
             <DialogTitle className="text-center">Campus Entry Pass</DialogTitle>
             <DialogDescription className="text-center">
-              Scan this QR code at the entrance turnstile
+              Show this QR code to volunteer staff at the event entrance gate
             </DialogDescription>
           </DialogHeader>
 
@@ -169,10 +209,23 @@ export function MyTicketsPage() {
                 <p className="font-semibold text-sm">
                   {selectedTicket.event?.title || 'Event Admission'}
                 </p>
+                <p className="text-xs text-primary font-medium">
+                  {selectedTicket.tier?.name || 'Ticket Pass'}
+                </p>
                 <p className="text-xs text-muted-foreground font-mono">
-                  Ticket ID: {selectedTicket.id}
+                  Ticket ID: {selectedTicket.id.slice(0, 13)}...
                 </p>
               </div>
+
+              <Button
+                variant="outline"
+                size="sm"
+                className="w-full gap-1.5 text-xs"
+                onClick={() => handleCopyQr(selectedTicket.qr_code)}
+              >
+                <Copy className="h-3.5 w-3.5" />
+                Copy QR Token (for Gate Scanner)
+              </Button>
             </div>
           )}
 

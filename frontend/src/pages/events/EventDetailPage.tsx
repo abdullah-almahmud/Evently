@@ -42,7 +42,7 @@ import { toast } from 'sonner'
 export function EventDetailPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
-  const { user, isAuthenticated } = useAuth()
+  const { user, isAuthenticated, isAdmin } = useAuth()
 
   const [event, setEvent] = useState<Event | null>(null)
   const [tiers, setTiers] = useState<TicketTier[]>([])
@@ -60,9 +60,9 @@ export function EventDetailPage() {
   const [volunteerMotivation, setVolunteerMotivation] = useState('')
   const [isSubmittingVolunteer, setIsSubmittingVolunteer] = useState(false)
 
-  const isOrganizerOfThisEvent = Boolean(
-    user && event && (user.id === event.organizer_id || user.role === 'ADMIN')
-  )
+  const isOrganizerOfThisEvent = Boolean(user && event && user.id === event.organizer_id)
+  const canManageThisEvent = Boolean(isOrganizerOfThisEvent || isAdmin)
+  const canBookThisEvent = !isAdmin && !isOrganizerOfThisEvent
 
   const fetchDetails = async () => {
     if (!id) return
@@ -84,14 +84,16 @@ export function EventDetailPage() {
         }
       }
 
-      // Check volunteer status if authenticated
-      if (isAuthenticated) {
+      // Check volunteer status if authenticated non-admin and non-organizer
+      if (isAuthenticated && user && user.role !== 'ADMIN' && user.id !== eventData.organizer_id) {
         try {
           const statusData = await volunteerApi.getMyStatus(id)
           setVolunteerApp(statusData)
         } catch {
           setVolunteerApp(null)
         }
+      } else {
+        setVolunteerApp(null)
       }
     } catch (err) {
       console.error('Failed to load event details:', err)
@@ -285,7 +287,7 @@ export function EventDetailPage() {
               <Share2 className="h-4 w-4" />
               Share Event
             </Button>
-            {isOrganizerOfThisEvent && (
+            {canManageThisEvent && (
               <Button variant="outline" size="sm" asChild className="gap-1.5">
                 <Link to={`/organizer/events/${event.id}/edit`}>
                   Manage Event
@@ -340,8 +342,8 @@ export function EventDetailPage() {
             </Card>
           </div>
 
-          {/* Volunteer Section */}
-          {!isOrganizerOfThisEvent && (
+          {/* Volunteer Section (Hidden for Admins and the event's own Organizer) */}
+          {canBookThisEvent && (
             <Card className="border-indigo-500/20 bg-indigo-500/5">
               <CardHeader className="pb-3">
                 <div className="flex items-center justify-between">
@@ -474,7 +476,11 @@ export function EventDetailPage() {
                         </div>
 
                         {/* Quantity Stepper */}
-                        {isAvailable ? (
+                        {!canBookThisEvent ? (
+                          <div className="pt-2 border-t mt-2 text-xs text-muted-foreground">
+                            {isAdmin ? 'Admin inspection mode' : 'Organizer view'}
+                          </div>
+                        ) : isAvailable ? (
                           <div className="flex items-center justify-between pt-2 border-t mt-2">
                             <span className="text-xs font-medium">Quantity</span>
                             <div className="flex items-center gap-2">
@@ -511,37 +517,50 @@ export function EventDetailPage() {
                   })}
 
                   {/* Summary & Booking Button */}
-                  <div className="pt-3 border-t space-y-3">
-                    <div className="flex items-center justify-between text-sm font-semibold">
-                      <span>Total ({totalTicketsSelected} {totalTicketsSelected === 1 ? 'ticket' : 'tickets'}):</span>
-                      <span className="text-base text-primary">
-                        {totalCost === 0 ? 'Free' : formatCurrency(totalCost)}
-                      </span>
+                  {canBookThisEvent ? (
+                    <div className="pt-3 border-t space-y-3">
+                      <div className="flex items-center justify-between text-sm font-semibold">
+                        <span>Total ({totalTicketsSelected} {totalTicketsSelected === 1 ? 'ticket' : 'tickets'}):</span>
+                        <span className="text-base text-primary">
+                          {totalCost === 0 ? 'Free' : formatCurrency(totalCost)}
+                        </span>
+                      </div>
+
+                      <Button
+                        className="w-full font-semibold shadow-sm"
+                        disabled={totalTicketsSelected === 0 || isBooking}
+                        onClick={handleCreateBooking}
+                      >
+                        {isBooking ? (
+                          <>
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            Processing Booking...
+                          </>
+                        ) : totalCost === 0 ? (
+                          `Confirm Free Registration (${totalTicketsSelected})`
+                        ) : (
+                          `Book Tickets (${formatCurrency(totalCost)})`
+                        )}
+                      </Button>
+
+                      <p className="text-[11px] text-muted-foreground text-center">
+                        Instant digital QR pass generation. Zero booking fees.
+                      </p>
                     </div>
-
-                    <Button
-                      className="w-full font-semibold shadow-sm"
-                      disabled={totalTicketsSelected === 0 || isBooking || isOrganizerOfThisEvent}
-                      onClick={handleCreateBooking}
-                    >
-                      {isBooking ? (
-                        <>
-                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                          Processing Booking...
-                        </>
-                      ) : isOrganizerOfThisEvent ? (
-                        'You are the Organizer'
-                      ) : totalCost === 0 ? (
-                        `Confirm Free Registration (${totalTicketsSelected})`
-                      ) : (
-                        `Book Tickets (${formatCurrency(totalCost)})`
-                      )}
-                    </Button>
-
-                    <p className="text-[11px] text-muted-foreground text-center">
-                      Instant digital QR pass generation. Zero booking fees.
-                    </p>
-                  </div>
+                  ) : (
+                    <div className="pt-3 border-t text-xs text-muted-foreground text-center space-y-2">
+                      <p>
+                        {isAdmin
+                          ? 'Administrators do not book personal attendee tickets.'
+                          : 'You are the organizer of this event.'}
+                      </p>
+                      <Button variant="outline" size="sm" asChild className="w-full">
+                        <Link to={`/organizer/events/${event.id}/analytics`}>
+                          View Event Analytics & Orders
+                        </Link>
+                      </Button>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="text-center py-6 space-y-3">

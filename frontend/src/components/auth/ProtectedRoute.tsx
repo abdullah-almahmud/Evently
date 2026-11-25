@@ -8,20 +8,46 @@ import { Skeleton } from '@/components/ui/skeleton'
 interface ProtectedRouteProps {
   children: ReactNode
   requiredRole?: UserRole | UserRole[]
+  disallowedRole?: UserRole | UserRole[]
+  requireStaff?: boolean
 }
 
-export function ProtectedRoute({ children, requiredRole }: ProtectedRouteProps) {
-  const { user, isAuthenticated, isLoading } = useAuth()
+export function ProtectedRoute({
+  children,
+  requiredRole,
+  disallowedRole,
+  requireStaff = false,
+}: ProtectedRouteProps) {
+  const { user, isAuthenticated, isLoading, canAccessStaffPortal } = useAuth()
   const location = useLocation()
 
-  useEffect(() => {
-    if (!isLoading && isAuthenticated && requiredRole && user) {
+  const isRoleBlocked = (() => {
+    if (!user) return false
+    if (requiredRole) {
       const allowedRoles = Array.isArray(requiredRole) ? requiredRole : [requiredRole]
-      if (!allowedRoles.includes(user.role)) {
+      if (!allowedRoles.includes(user.role)) return true
+    }
+    if (disallowedRole) {
+      const blockedRoles = Array.isArray(disallowedRole) ? disallowedRole : [disallowedRole]
+      if (blockedRoles.includes(user.role)) return true
+    }
+    if (requireStaff && !canAccessStaffPortal) {
+      return true
+    }
+    return false
+  })()
+
+  useEffect(() => {
+    if (!isLoading && isAuthenticated && user && isRoleBlocked) {
+      if (requireStaff && !canAccessStaffPortal) {
+        toast.error('Access denied: Only approved event volunteers/staff can access the Staff Portal.')
+      } else if (disallowedRole && user.role === 'ADMIN') {
+        toast.info('Administrators use the Admin Console instead of personal attendee bookings.')
+      } else {
         toast.error('Access denied: You do not have permission to view this page.')
       }
     }
-  }, [isLoading, isAuthenticated, requiredRole, user])
+  }, [isLoading, isAuthenticated, user, isRoleBlocked, requireStaff, canAccessStaffPortal, disallowedRole])
 
   if (isLoading) {
     return (
@@ -45,11 +71,11 @@ export function ProtectedRoute({ children, requiredRole }: ProtectedRouteProps) 
     )
   }
 
-  if (requiredRole && user) {
-    const allowedRoles = Array.isArray(requiredRole) ? requiredRole : [requiredRole]
-    if (!allowedRoles.includes(user.role)) {
-      return <Navigate to="/" replace />
+  if (isRoleBlocked) {
+    if (user?.role === 'ADMIN' && disallowedRole) {
+      return <Navigate to="/admin" replace />
     }
+    return <Navigate to="/" replace />
   }
 
   return <>{children}</>

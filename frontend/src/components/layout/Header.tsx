@@ -1,6 +1,19 @@
 import { useState } from 'react'
 import { Link, NavLink, useNavigate } from 'react-router-dom'
-import { Calendar, Menu, X, User as UserIcon, Ticket, LogOut, Shield, Compass, PlusCircle, Building2, ShieldCheck, ShoppingBag } from 'lucide-react'
+import {
+  Calendar,
+  Menu,
+  X,
+  User as UserIcon,
+  Ticket,
+  LogOut,
+  Shield,
+  Compass,
+  PlusCircle,
+  Building2,
+  ShieldCheck,
+  ShoppingBag,
+} from 'lucide-react'
 import { useAuth } from '@/hooks/useAuth'
 import { Button } from '@/components/ui/button'
 import {
@@ -15,7 +28,7 @@ import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 
 export function Header() {
-  const { user, isAuthenticated, isOrganizer, isAdmin, logout } = useAuth()
+  const { user, isAuthenticated, isOrganizer, isAdmin, isStaff, canBookTickets, logout } = useAuth()
   const navigate = useNavigate()
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
 
@@ -61,7 +74,7 @@ export function Header() {
               </span>
             </NavLink>
 
-            {isAuthenticated && (
+            {isAuthenticated && canBookTickets && (
               <>
                 <NavLink to="/my-bookings" className={navLinkClass}>
                   <span className="flex items-center gap-1.5">
@@ -75,13 +88,16 @@ export function Header() {
                     My Tickets
                   </span>
                 </NavLink>
-                <NavLink to="/staff/events" className={navLinkClass}>
-                  <span className="flex items-center gap-1.5 text-indigo-600 dark:text-indigo-400">
-                    <ShieldCheck className="h-4 w-4" />
-                    Staff Portal
-                  </span>
-                </NavLink>
               </>
+            )}
+
+            {isAuthenticated && isStaff && (
+              <NavLink to="/staff/events" className={navLinkClass}>
+                <span className="flex items-center gap-1.5 text-indigo-600 dark:text-indigo-400">
+                  <ShieldCheck className="h-4 w-4" />
+                  Staff Portal
+                </span>
+              </NavLink>
             )}
 
             {isOrganizer && (
@@ -99,7 +115,7 @@ export function Header() {
               <NavLink to="/admin" className={navLinkClass}>
                 <span className="flex items-center gap-1.5 text-amber-600 dark:text-amber-400 font-medium">
                   <Shield className="h-4 w-4" />
-                  Admin
+                  Admin Console
                 </span>
               </NavLink>
             )}
@@ -137,10 +153,15 @@ export function Header() {
                   <div className="flex flex-col space-y-1">
                     <p className="text-sm font-semibold leading-none">{user.full_name || user.username}</p>
                     <p className="text-xs leading-none text-muted-foreground">{user.email}</p>
-                    <div className="pt-1.5">
+                    <div className="pt-1.5 flex items-center gap-1.5 flex-wrap">
                       <Badge variant="secondary" className="text-[10px] uppercase font-mono tracking-wider">
                         {user.role}
                       </Badge>
+                      {isStaff && (
+                        <Badge className="text-[10px] uppercase font-mono tracking-wider bg-indigo-600">
+                          STAFF
+                        </Badge>
+                      )}
                     </div>
                   </div>
                 </DropdownMenuLabel>
@@ -151,24 +172,32 @@ export function Header() {
                     <span>Profile & Settings</span>
                   </Link>
                 </DropdownMenuItem>
-                <DropdownMenuItem asChild>
-                  <Link to="/my-bookings" className="cursor-pointer flex items-center">
-                    <ShoppingBag className="mr-2 h-4 w-4" />
-                    <span>My Bookings</span>
-                  </Link>
-                </DropdownMenuItem>
-                <DropdownMenuItem asChild>
-                  <Link to="/tickets" className="cursor-pointer flex items-center">
-                    <Ticket className="mr-2 h-4 w-4" />
-                    <span>My Tickets</span>
-                  </Link>
-                </DropdownMenuItem>
-                <DropdownMenuItem asChild>
-                  <Link to="/staff/events" className="cursor-pointer flex items-center text-indigo-600 dark:text-indigo-400">
-                    <ShieldCheck className="mr-2 h-4 w-4" />
-                    <span>Staff Portal</span>
-                  </Link>
-                </DropdownMenuItem>
+
+                {canBookTickets && (
+                  <>
+                    <DropdownMenuItem asChild>
+                      <Link to="/my-bookings" className="cursor-pointer flex items-center">
+                        <ShoppingBag className="mr-2 h-4 w-4" />
+                        <span>My Bookings</span>
+                      </Link>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem asChild>
+                      <Link to="/tickets" className="cursor-pointer flex items-center">
+                        <Ticket className="mr-2 h-4 w-4" />
+                        <span>My Tickets</span>
+                      </Link>
+                    </DropdownMenuItem>
+                  </>
+                )}
+
+                {isStaff && (
+                  <DropdownMenuItem asChild>
+                    <Link to="/staff/events" className="cursor-pointer flex items-center text-indigo-600 dark:text-indigo-400">
+                      <ShieldCheck className="mr-2 h-4 w-4" />
+                      <span>Staff Portal</span>
+                    </Link>
+                  </DropdownMenuItem>
+                )}
 
                 {isOrganizer && (
                   <>
@@ -227,7 +256,7 @@ export function Header() {
             size="icon"
             className="md:hidden"
             onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
-            aria-label="Toggle menu"
+            aria-label="Toggle Menu"
           >
             {mobileMenuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
           </Button>
@@ -246,7 +275,7 @@ export function Header() {
               Browse Events
             </Link>
 
-            {isAuthenticated && (
+            {isAuthenticated && canBookTickets && (
               <>
                 <Link
                   to="/my-bookings"
@@ -262,14 +291,17 @@ export function Header() {
                 >
                   My Tickets
                 </Link>
-                <Link
-                  to="/staff/events"
-                  onClick={() => setMobileMenuOpen(false)}
-                  className="px-3 py-2 text-sm font-medium rounded-md hover:bg-accent text-indigo-600 dark:text-indigo-400"
-                >
-                  Staff Portal
-                </Link>
               </>
+            )}
+
+            {isAuthenticated && isStaff && (
+              <Link
+                to="/staff/events"
+                onClick={() => setMobileMenuOpen(false)}
+                className="px-3 py-2 text-sm font-medium rounded-md hover:bg-accent text-indigo-600 dark:text-indigo-400"
+              >
+                Staff Portal
+              </Link>
             )}
 
             {isOrganizer && (

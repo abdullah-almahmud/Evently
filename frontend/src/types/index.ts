@@ -23,7 +23,22 @@ export interface User {
   avatar_url?: string | null
   role: UserRole
   is_active: boolean
+  is_staff?: boolean
   created_at: string
+}
+
+export interface AdminOverview {
+  total_users: number
+  attendees_count: number
+  organizers_count: number
+  admins_count: number
+  staff_users_count: number
+  total_events: number
+  published_events: number
+  draft_events: number
+  pending_organizer_requests: number
+  total_bookings: number
+  total_tickets: number
 }
 
 export interface TicketTier {

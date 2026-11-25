@@ -168,6 +168,7 @@ async def get_event_tickets_list(
     for ticket in tickets:
         items.append(CheckInTicketListItem(
             id=ticket.id,
+            ticket_id=ticket.id,
             user_id=ticket.user_id,
             attendee_name=ticket.user.full_name if ticket.user else "Unknown",
             attendee_email=ticket.user.email if ticket.user else "Unknown",

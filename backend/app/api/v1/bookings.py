@@ -24,11 +24,19 @@ from app.models import (
     UserRole,
 )
 from app.schemas.booking import BookingCreate, BookingResponse, BookingItemResponse
-from app.schemas.ticket import TicketResponse
+from app.schemas.ticket import TicketEventSummary, TicketResponse, TicketTierSummary
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _booking_load_options():
+    return (
+        selectinload(Booking.event).selectinload(Event.venue),
+        selectinload(Booking.items).selectinload(BookingItem.tier),
+        selectinload(Booking.items).selectinload(BookingItem.tickets),
+    )
 
 
 def _build_booking_response(booking: Booking) -> BookingResponse:
@@ -36,15 +44,31 @@ def _build_booking_response(booking: Booking) -> BookingResponse:
     item_responses = []
     all_tickets = []
     for item in (booking.items or []):
+        tier_summary = TicketTierSummary.model_validate(item.tier) if item.tier else None
         item_responses.append(BookingItemResponse(
             id=item.id,
             tier_id=item.tier_id,
             seat_id=item.seat_id,
             quantity=item.quantity,
             unit_price=item.unit_price,
+            tier=tier_summary,
         ))
         for ticket in (item.tickets or []):
-            all_tickets.append(TicketResponse.model_validate(ticket))
+            all_tickets.append(TicketResponse(
+                id=ticket.id,
+                event_id=ticket.event_id,
+                tier_id=ticket.tier_id,
+                user_id=ticket.user_id,
+                seat_id=ticket.seat_id,
+                qr_code=ticket.qr_code,
+                status=ticket.status,
+                checked_in_at=ticket.checked_in_at,
+                created_at=ticket.created_at,
+                event=None,
+                tier=tier_summary,
+            ))
+
+    event_summary = TicketEventSummary.model_validate(booking.event) if booking.event else None
 
     return BookingResponse(
         id=booking.id,
@@ -56,6 +80,7 @@ def _build_booking_response(booking: Booking) -> BookingResponse:
         updated_at=booking.updated_at,
         items=item_responses,
         tickets=all_tickets if all_tickets else None,
+        event=event_summary,
     )
 
 
@@ -91,6 +116,12 @@ async def create_booking(
     Creates a new booking for the authenticated user.
     For free events, immediately confirms and issues tickets.
     """
+    if current_user.role == UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="System administrators cannot create attendee bookings",
+        )
+
     if not data.items:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Booking must include at least one item")
 
@@ -99,6 +130,8 @@ async def create_booking(
     event = event_res.scalar_one_or_none()
     if not event:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+    if event.organizer_id == current_user.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Organizers cannot book tickets for their own event")
     if event.status != EventStatus.PUBLISHED:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Event is not available for booking")
 
@@ -209,13 +242,11 @@ async def create_booking(
 
     await db.commit()
 
-    # Reload full booking with items + tickets
+    # Reload full booking with items + tickets + event + tier
     full_res = await db.execute(
         select(Booking)
         .where(Booking.id == booking.id)
-        .options(
-            selectinload(Booking.items).selectinload(BookingItem.tickets)
-        )
+        .options(*_booking_load_options())
     )
     full_booking = full_res.scalar_one()
 
@@ -228,10 +259,16 @@ async def get_my_bookings(
     db: AsyncSession = Depends(get_db),
 ) -> List[BookingResponse]:
     """Returns the booking history for the authenticated user, ordered by most recent."""
+    if current_user.role == UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="System administrators do not hold personal bookings",
+        )
+
     result = await db.execute(
         select(Booking)
         .where(Booking.user_id == current_user.id)
-        .options(selectinload(Booking.items).selectinload(BookingItem.tickets))
+        .options(*_booking_load_options())
         .order_by(Booking.created_at.desc())
     )
     bookings = result.scalars().all()
@@ -244,7 +281,7 @@ async def get_event_bookings(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> List[BookingResponse]:
-    """Organizer only: list all bookings for their event."""
+    """Organizer or Admin: list all bookings for an event."""
     event_res = await db.execute(select(Event).where(Event.id == event_id))
     event = event_res.scalar_one_or_none()
     if not event:
@@ -256,7 +293,7 @@ async def get_event_bookings(
     result = await db.execute(
         select(Booking)
         .where(Booking.event_id == event_id)
-        .options(selectinload(Booking.items).selectinload(BookingItem.tickets))
+        .options(*_booking_load_options())
         .order_by(Booking.created_at.desc())
     )
     bookings = result.scalars().all()
@@ -273,10 +310,7 @@ async def get_booking_detail(
     result = await db.execute(
         select(Booking)
         .where(Booking.id == booking_id)
-        .options(
-            selectinload(Booking.items).selectinload(BookingItem.tickets),
-            selectinload(Booking.event),
-        )
+        .options(*_booking_load_options())
     )
     booking = result.scalar_one_or_none()
     if not booking:
@@ -302,13 +336,16 @@ async def cancel_booking(
     """Cancel a booking before the event starts. Restores tier availability and cancels tickets."""
     from datetime import datetime, timezone
 
+    if current_user.role == UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="System administrators do not manage personal bookings",
+        )
+
     result = await db.execute(
         select(Booking)
         .where(Booking.id == booking_id)
-        .options(
-            selectinload(Booking.items).selectinload(BookingItem.tickets),
-            selectinload(Booking.event),
-        )
+        .options(*_booking_load_options())
     )
     booking = result.scalar_one_or_none()
     if not booking:
@@ -332,7 +369,6 @@ async def cancel_booking(
 
     # Restore quantities and cancel tickets
     for item in booking.items:
-        # Restore tier availability
         tier_res = await db.execute(select(TicketTier).where(TicketTier.id == item.tier_id))
         tier = tier_res.scalar_one_or_none()
         if tier:
@@ -341,6 +377,9 @@ async def cancel_booking(
         for ticket in (item.tickets or []):
             if ticket.status != TicketStatus.CANCELLED:
                 ticket.status = TicketStatus.CANCELLED
+
+    if booking.event and booking.event.status == EventStatus.SOLD_OUT:
+        booking.event.status = EventStatus.PUBLISHED
 
     booking.status = BookingStatus.CANCELLED
     await db.commit()
@@ -351,7 +390,7 @@ async def cancel_booking(
     full_res = await db.execute(
         select(Booking)
         .where(Booking.id == booking.id)
-        .options(selectinload(Booking.items).selectinload(BookingItem.tickets))
+        .options(*_booking_load_options())
     )
     full_booking = full_res.scalar_one()
     return _build_booking_response(full_booking)

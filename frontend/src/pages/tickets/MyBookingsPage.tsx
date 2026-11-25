@@ -27,7 +27,7 @@ import type { Booking, BookingStatus } from '@/types'
 import { toast } from 'sonner'
 
 function statusBadge(status: BookingStatus, totalAmount: number) {
-  if (status === 'CONFIRMED' && totalAmount === 0) {
+  if (status === 'CONFIRMED' && Number(totalAmount) === 0) {
     return (
       <Badge className="bg-emerald-600 hover:bg-emerald-700 gap-1">
         <CheckCircle2 className="h-3 w-3" />
@@ -177,9 +177,9 @@ export function MyBookingsPage() {
 
                     <div className="flex flex-col items-end gap-2">
                       <div className="text-xl font-bold text-primary">
-                        {booking.total_amount === 0
+                        {Number(booking.total_amount) === 0
                           ? 'Free'
-                          : `৳${booking.total_amount.toLocaleString()}`}
+                          : `৳${Number(booking.total_amount).toLocaleString()}`}
                       </div>
 
                       <div className="flex items-center gap-2">
@@ -239,12 +239,12 @@ export function MyBookingsPage() {
                                 </td>
                                 <td className="py-2 px-3 text-center">{item.quantity}</td>
                                 <td className="py-2 px-3 text-right text-muted-foreground">
-                                  {item.unit_price === 0 ? 'Free' : `৳${item.unit_price}`}
+                                  {Number(item.unit_price) === 0 ? 'Free' : `৳${Number(item.unit_price).toLocaleString()}`}
                                 </td>
                                 <td className="py-2 px-3 text-right font-semibold">
-                                  {item.unit_price === 0
+                                  {Number(item.unit_price) === 0
                                     ? 'Free'
-                                    : `৳${(item.unit_price * item.quantity).toLocaleString()}`}
+                                    : `৳${(Number(item.unit_price) * item.quantity).toLocaleString()}`}
                                 </td>
                               </tr>
                             ))}

@@ -26,6 +26,8 @@ import type {
   CheckInResult,
   CheckInStats,
   CheckInTicketItem,
+  AdminOverview,
+  UserRole,
 } from '@/types'
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1'
@@ -190,13 +192,13 @@ export const usersApi = {
   },
 
   submitOrganizerRequest: async (reason: string): Promise<OrganizerRequest> => {
-    const res = await api.post<OrganizerRequest>('/users/organizer-request', { reason })
+    const res = await api.post<OrganizerRequest>('/users/me/organizer-request', { reason })
     return res.data
   },
 
   getMyOrganizerRequest: async (): Promise<OrganizerRequest | null> => {
     try {
-      const res = await api.get<OrganizerRequest>('/users/organizer-request/me')
+      const res = await api.get<OrganizerRequest>('/users/me/organizer-request')
       return res.data
     } catch (err: unknown) {
       if (axios.isAxiosError(err) && err.response?.status === 404) {
@@ -298,6 +300,11 @@ export const venuesApi = {
 }
 
 export const adminApi = {
+  getOverview: async (): Promise<AdminOverview> => {
+    const res = await api.get<AdminOverview>('/admin/overview')
+    return res.data
+  },
+
   listOrganizerRequests: async (status?: OrganizerRequestStatus): Promise<OrganizerRequest[]> => {
     const res = await api.get<OrganizerRequest[]>('/admin/organizer-requests', {
       params: status ? { status } : undefined,
@@ -309,7 +316,7 @@ export const adminApi = {
     requestId: string,
     status: 'APPROVED' | 'REJECTED'
   ): Promise<OrganizerRequest> => {
-    const res = await api.post<OrganizerRequest>(`/admin/organizer-requests/${requestId}/review`, {
+    const res = await api.put<OrganizerRequest>(`/admin/organizer-requests/${requestId}`, {
       status,
     })
     return res.data
@@ -317,6 +324,21 @@ export const adminApi = {
 
   listUsers: async (): Promise<User[]> => {
     const res = await api.get<User[]>('/admin/users')
+    return res.data
+  },
+
+  updateUserRole: async (userId: string, role: UserRole): Promise<User> => {
+    const res = await api.put<User>(`/admin/users/${userId}/role`, { role })
+    return res.data
+  },
+
+  toggleUserActive: async (userId: string): Promise<User> => {
+    const res = await api.put<User>(`/admin/users/${userId}/toggle-active`)
+    return res.data
+  },
+
+  listAllEvents: async (): Promise<Event[]> => {
+    const res = await api.get<Event[]>('/admin/events')
     return res.data
   },
 }

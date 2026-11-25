@@ -546,12 +546,24 @@ async def apply_as_volunteer(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ) -> VolunteerApplicationResponse:
-    """Any authenticated user can apply to volunteer for an event."""
+    """Attendees (or non-organizer users) can apply to volunteer for an event."""
+    if current_user.role == UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="System administrators cannot apply as event volunteers",
+        )
+
     # Verify event exists
     event_res = await db.execute(select(Event).where(Event.id == event_id))
     event = event_res.scalar_one_or_none()
     if not event:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+
+    if event.organizer_id == current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You are the organizer of this event and cannot apply as a volunteer",
+        )
 
     # Check for duplicate application
     existing_res = await db.execute(
