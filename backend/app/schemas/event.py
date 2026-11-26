@@ -5,6 +5,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from app.models import EventCategory, EventStatus
 from app.schemas.user import UserResponse
+from app.schemas.venue import VenueResponse
 
 
 class TicketTierCreate(BaseModel):
@@ -54,6 +55,7 @@ class EventCreate(BaseModel):
     registration_start: Optional[datetime] = None
     registration_end: Optional[datetime] = None
     is_seated: bool = False
+    seat_hold_enabled: bool = False
     ticket_tiers: Optional[List[TicketTierCreate]] = None
 
     model_config = ConfigDict(populate_by_name=True)
@@ -80,6 +82,7 @@ class EventUpdate(BaseModel):
     registration_end: Optional[datetime] = None
     status: Optional[EventStatus] = None
     is_seated: Optional[bool] = None
+    seat_hold_enabled: Optional[bool] = None
     ticket_tiers: Optional[List[TicketTierCreate]] = None
 
     model_config = ConfigDict(populate_by_name=True)
@@ -108,10 +111,12 @@ class EventResponse(BaseModel):
     registration_end: Optional[datetime] = None
     status: EventStatus
     is_seated: bool
+    seat_hold_enabled: bool = False
     created_at: datetime
     updated_at: datetime
     organizer: Optional[UserResponse] = None
     venue_name: Optional[str] = None
+    venue: Optional[VenueResponse] = None
     tiers: List[TicketTierResponse] = []
     ticket_tiers: List[TicketTierResponse] = []
 

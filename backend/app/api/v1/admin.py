@@ -17,6 +17,7 @@ from app.models import (
     Ticket,
     User,
     UserRole,
+    Venue,
 )
 from app.schemas.event import EventResponse
 from app.schemas.user import (
@@ -284,7 +285,11 @@ async def list_all_platform_events(
 
     query = (
         select(Event)
-        .options(selectinload(Event.organizer), selectinload(Event.venue), selectinload(Event.tiers))
+        .options(
+            selectinload(Event.organizer),
+            selectinload(Event.venue).selectinload(Venue.sections),
+            selectinload(Event.tiers),
+        )
         .order_by(Event.created_at.desc())
     )
     result = await db.execute(query)

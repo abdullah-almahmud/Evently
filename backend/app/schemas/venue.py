@@ -29,9 +29,10 @@ class VenueCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=255)
     address: str = Field(..., min_length=5, max_length=500)
     city: str = Field(..., min_length=2, max_length=100)
-    total_capacity: int = Field(..., gt=0)
+    total_capacity: int = Field(..., gt=0, le=50000)
     layout_type: LayoutType = LayoutType.GENERAL_ADMISSION
     description: Optional[str] = None
+    sections: Optional[List[VenueSectionCreate]] = None
 
 
 class VenueUpdate(BaseModel):

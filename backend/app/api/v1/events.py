@@ -1,16 +1,29 @@
 import logging
 import math
-import string
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import List, Optional
+from typing import Dict, List, Optional
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from app.api.v1.venues import format_venue_response
 from app.core.database import get_db
-from app.core.deps import get_current_active_user, get_current_organizer, get_current_user, oauth2_scheme
+from app.core.deps import (
+    get_current_active_user,
+    get_current_organizer,
+    get_current_user,
+    get_optional_current_user,
+    oauth2_scheme,
+)
+from app.core.redis import hold_seat, release_seat
+from app.core.seating import (
+    build_generic_sections_for_capacity,
+    row_label_from_index,
+    sort_sections_front_to_back,
+)
 from app.core.security import decode_token
 from app.models import (
     Booking,
@@ -22,6 +35,8 @@ from app.models import (
     EventStatus,
     LayoutType,
     Seat,
+    SeatHold,
+    SeatHoldStatus,
     StaffRole,
     TicketTier,
     User,
@@ -40,7 +55,12 @@ from app.schemas.event import (
     TicketTierResponse,
     TicketTierUpdate,
 )
-from app.schemas.seat import EventSeatsResponse, SeatResponse, SeatSectionGroup
+from app.schemas.seat import (
+    EventSeatsResponse,
+    SeatHoldActionResponse,
+    SeatResponse,
+    SeatSectionGroup,
+)
 from app.schemas.staff import (
     StaffResponse,
     VolunteerApplicationCreate,
@@ -53,10 +73,23 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+HOLD_DURATION_MINUTES = 10
+MAX_HELD_SEATS_PER_USER = 4
+
+
+def _event_load_options():
+    """Consistent eager-loading options for Event responses."""
+    return (
+        selectinload(Event.organizer),
+        selectinload(Event.venue).selectinload(Venue.sections),
+        selectinload(Event.tiers),
+    )
+
 
 def format_event_response(event: Event) -> EventResponse:
     """Helper to convert Event ORM model to EventResponse with nested relationships."""
     venue_name = event.venue.name if event.venue else None
+    venue_resp = format_venue_response(event.venue) if event.venue else None
     tier_responses = [TicketTierResponse.model_validate(t) for t in (event.tiers or [])]
     return EventResponse(
         id=event.id,
@@ -72,13 +105,155 @@ def format_event_response(event: Event) -> EventResponse:
         registration_end=event.registration_end,
         status=event.status,
         is_seated=event.is_seated,
+        seat_hold_enabled=bool(event.seat_hold_enabled) if event.is_seated else False,
         created_at=event.created_at,
         updated_at=event.updated_at,
         organizer=event.organizer,
         venue_name=venue_name,
+        venue=venue_resp,
         tiers=tier_responses,
         ticket_tiers=tier_responses,
     )
+
+
+async def _ensure_event_seats(
+    event: Event,
+    db: AsyncSession,
+    force_regenerate: bool = False,
+) -> List[Seat]:
+    """
+    Generate or retrieve physical seats covering the FULL venue capacity for a seated event.
+    Sections are ordered front-to-back and mapped to active TicketTiers (highest price in front rows).
+    """
+    if not event.is_seated or not event.venue_id:
+        return []
+
+    if not force_regenerate:
+        existing_res = await db.execute(
+            select(Seat).where(Seat.event_id == event.id).order_by(Seat.row_label, Seat.seat_number)
+        )
+        existing_seats = list(existing_res.scalars().all())
+        if existing_seats:
+            return existing_seats
+
+    # Load venue & sections
+    venue_res = await db.execute(
+        select(Venue).where(Venue.id == event.venue_id).options(selectinload(Venue.sections))
+    )
+    venue = venue_res.scalar_one_or_none()
+    if not venue or venue.layout_type != LayoutType.SEATED:
+        return []
+
+    # Backfill generic sections if seated venue doesn't have any yet
+    sections = list(venue.sections or [])
+    if not sections:
+        for spec in build_generic_sections_for_capacity(venue.total_capacity):
+            sec = VenueSection(
+                venue_id=venue.id,
+                name=spec["name"],
+                rows=spec["rows"],
+                seats_per_row=spec["seats_per_row"],
+            )
+            db.add(sec)
+            sections.append(sec)
+        await db.flush()
+
+    sections = sort_sections_front_to_back(sections)
+
+    # Clear existing seats cleanly in one bulk statement when forcing regeneration
+    if force_regenerate:
+        # Guard against wiping seats if confirmed/pending bookings already reference seats
+        booked_seat_cnt = (
+            await db.execute(
+                select(func.count(BookingItem.id))
+                .join(Booking, Booking.id == BookingItem.booking_id)
+                .where(
+                    Booking.event_id == event.id,
+                    BookingItem.seat_id.is_not(None),
+                    Booking.status.in_([BookingStatus.CONFIRMED, BookingStatus.PENDING]),
+                )
+            )
+        ).scalar_one()
+        if booked_seat_cnt > 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot regenerate seats after attendees have booked seats for this event.",
+            )
+        await db.execute(delete(Seat).where(Seat.event_id == event.id))
+        await db.flush()
+
+    # Load active tiers sorted highest price first (VIP in front -> Regular/Free behind)
+    tiers_res = await db.execute(
+        select(TicketTier)
+        .where(TicketTier.event_id == event.id, TicketTier.is_active.is_(True))
+        .order_by(TicketTier.price.desc(), TicketTier.created_at.asc())
+    )
+    tiers = list(tiers_res.scalars().all())
+
+    seat_dicts: List[dict] = []
+    tier_seat_counts: Dict[UUID, int] = {t.id: 0 for t in tiers}
+
+    if len(sections) == 1 and len(tiers) >= 2:
+        # Single-block room with multiple tiers: allocate front rows (~35%) to premium tier, rest to standard
+        section = sections[0]
+        front_rows = max(1, round(section.rows * 0.35))
+        if front_rows >= section.rows and section.rows > 1:
+            front_rows = section.rows - 1
+        for row_idx in range(section.rows):
+            tier = tiers[0] if row_idx < front_rows else tiers[-1]
+            row_lbl = row_label_from_index(row_idx)
+            for seat_num in range(1, section.seats_per_row + 1):
+                seat_dicts.append({
+                    "id": uuid.uuid4(),
+                    "section_id": section.id,
+                    "event_id": event.id,
+                    "tier_id": tier.id,
+                    "row_label": row_lbl,
+                    "seat_number": seat_num,
+                })
+                tier_seat_counts[tier.id] = tier_seat_counts.get(tier.id, 0) + 1
+    else:
+        for idx, section in enumerate(sections):
+            tier = tiers[idx] if idx < len(tiers) else (tiers[-1] if tiers else None)
+            for row_idx in range(section.rows):
+                row_lbl = row_label_from_index(row_idx)
+                for seat_num in range(1, section.seats_per_row + 1):
+                    seat_dicts.append({
+                        "id": uuid.uuid4(),
+                        "section_id": section.id,
+                        "event_id": event.id,
+                        "tier_id": tier.id if tier else None,
+                        "row_label": row_lbl,
+                        "seat_number": seat_num,
+                    })
+                    if tier:
+                        tier_seat_counts[tier.id] = tier_seat_counts.get(tier.id, 0) + 1
+
+    if seat_dicts:
+        await db.execute(insert(Seat).values(seat_dicts))
+
+    # Sync tier quantities with exact generated full-venue seat counts when unbooked
+    if tiers:
+        booked_exists = (
+            await db.execute(
+                select(func.count(Booking.id)).where(
+                    Booking.event_id == event.id,
+                    Booking.status.in_([BookingStatus.CONFIRMED, BookingStatus.PENDING]),
+                )
+            )
+        ).scalar_one() > 0
+        if not booked_exists:
+            for tier in tiers:
+                count = tier_seat_counts.get(tier.id, 0)
+                if count > 0:
+                    tier.total_quantity = count
+                    tier.available_quantity = count
+
+    await db.flush()
+    created_seats_res = await db.execute(
+        select(Seat).where(Seat.event_id == event.id).order_by(Seat.row_label, Seat.seat_number)
+    )
+    return list(created_seats_res.scalars().all())
 
 
 @router.get("/my-events", response_model=List[EventResponse])
@@ -88,12 +263,11 @@ async def list_my_events(
 ) -> List[EventResponse]:
     """
     Lists all events created by the authenticated organizer across all lifecycle states.
-    Administrators receive all events they authored or all events if preferred.
     """
     query = (
         select(Event)
         .where(Event.organizer_id == current_user.id)
-        .options(selectinload(Event.organizer), selectinload(Event.venue), selectinload(Event.tiers))
+        .options(*_event_load_options())
         .order_by(Event.created_at.desc())
     )
     result = await db.execute(query)
@@ -130,7 +304,7 @@ async def list_published_events(
     data_query = (
         select(Event)
         .where(*base_filter)
-        .options(selectinload(Event.organizer), selectinload(Event.venue), selectinload(Event.tiers))
+        .options(*_event_load_options())
         .order_by(Event.start_datetime.asc())
         .offset(offset)
         .limit(limit)
@@ -157,7 +331,7 @@ async def create_event(
 ) -> EventResponse:
     """
     Creates a new event draft for the authenticated organizer.
-    Validates datetime ranges and venue existence if provided.
+    Enforces venue compatibility for interactive seated events and generates full venue seats immediately.
     """
     if data.end_datetime <= data.start_datetime:
         raise HTTPException(
@@ -165,6 +339,7 @@ async def create_event(
             detail="Event end datetime must be after start datetime",
         )
 
+    venue = None
     if data.venue_id:
         venue_res = await db.execute(select(Venue).where(Venue.id == data.venue_id))
         venue = venue_res.scalar_one_or_none()
@@ -173,6 +348,20 @@ async def create_event(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Specified venue does not exist",
             )
+
+    if data.is_seated:
+        if not venue:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Interactive seat selection requires selecting a Seated campus venue.",
+            )
+        if venue.layout_type != LayoutType.SEATED:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Venue '{venue.name}' is General Admission and does not support interactive seat selection.",
+            )
+
+    resolved_seat_hold = bool(data.seat_hold_enabled) if data.is_seated else False
 
     new_event = Event(
         title=data.title,
@@ -187,6 +376,7 @@ async def create_event(
         registration_end=data.registration_end,
         status=EventStatus.DRAFT,
         is_seated=data.is_seated,
+        seat_hold_enabled=resolved_seat_hold,
     )
     db.add(new_event)
     await db.flush()
@@ -205,15 +395,18 @@ async def create_event(
                 is_active=True,
             )
             db.add(tier)
+        await db.flush()
+
+    if new_event.is_seated:
+        await _ensure_event_seats(new_event, db, force_regenerate=False)
 
     await db.commit()
-    await db.refresh(new_event)
 
     # Reload with relationships
     query = (
         select(Event)
         .where(Event.id == new_event.id)
-        .options(selectinload(Event.organizer), selectinload(Event.venue), selectinload(Event.tiers))
+        .options(*_event_load_options())
     )
     res = await db.execute(query)
     created = res.scalar_one()
@@ -228,12 +421,11 @@ async def get_event_detail(
 ) -> EventResponse:
     """
     Retrieves detailed event information.
-    Publicly accessible if published; drafts are visible to event author or admin.
     """
     query = (
         select(Event)
         .where(Event.id == event_id)
-        .options(selectinload(Event.organizer), selectinload(Event.venue), selectinload(Event.tiers))
+        .options(*_event_load_options())
     )
     res = await db.execute(query)
     event = res.scalar_one_or_none()
@@ -256,12 +448,13 @@ async def update_event(
     db: AsyncSession = Depends(get_db),
 ) -> EventResponse:
     """
-    Updates an event's information. Only the organizer who owns the event or an admin can update it.
+    Updates an event's information.
+    Enforces immutability: once created without interactive seats, an event remains General Admission.
     """
     query = (
         select(Event)
         .where(Event.id == event_id)
-        .options(selectinload(Event.organizer), selectinload(Event.venue), selectinload(Event.tiers))
+        .options(*_event_load_options())
     )
     res = await db.execute(query)
     event = res.scalar_one_or_none()
@@ -279,11 +472,47 @@ async def update_event(
         )
 
     update_dict = data.model_dump(exclude_unset=True)
-    # Remove nested tiers from direct model assignment
     tier_updates = update_dict.pop("ticket_tiers", None)
+
+    # Immutability rule: General Admission events cannot be turned into interactive seated events later
+    if "is_seated" in update_dict:
+        if not event.is_seated and update_dict["is_seated"] is True:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Once an event is created without interactive seats, it remains General Admission and cannot be changed.",
+            )
+        if event.is_seated and update_dict["is_seated"] is False:
+            booked_exists = (
+                await db.execute(
+                    select(func.count(Booking.id)).where(
+                        Booking.event_id == event.id,
+                        Booking.status.in_([BookingStatus.CONFIRMED, BookingStatus.PENDING]),
+                    )
+                )
+            ).scalar_one() > 0
+            if booked_exists:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot disable interactive seats after bookings have been placed.",
+                )
+
+    venue_changed = "venue_id" in update_dict and update_dict["venue_id"] != event.venue_id
+    if venue_changed and event.is_seated:
+        new_venue = (
+            await db.execute(select(Venue).where(Venue.id == update_dict["venue_id"]))
+        ).scalar_one_or_none()
+        if not new_venue or new_venue.layout_type != LayoutType.SEATED:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Seated events can only use a Seated venue.",
+            )
 
     for field, value in update_dict.items():
         setattr(event, field, value)
+
+    # Never allow seat_hold_enabled on a non-seated event
+    if not event.is_seated:
+        event.seat_hold_enabled = False
 
     if tier_updates:
         for t_data in tier_updates:
@@ -299,9 +528,15 @@ async def update_event(
             )
             db.add(tier)
 
+    if event.is_seated and venue_changed:
+        await _ensure_event_seats(event, db, force_regenerate=True)
+
     await db.commit()
-    await db.refresh(event)
-    return format_event_response(event)
+
+    refreshed = (
+        await db.execute(select(Event).where(Event.id == event.id).options(*_event_load_options()))
+    ).scalar_one()
+    return format_event_response(refreshed)
 
 
 @router.delete("/{event_id}", status_code=status.HTTP_200_OK)
@@ -348,12 +583,12 @@ async def publish_event(
 ) -> EventResponse:
     """
     Transitions an event status to PUBLISHED.
-    Requires at least one ticket tier to have been created.
+    Requires at least one ticket tier and ensures full-venue seats exist for seated events.
     """
     query = (
         select(Event)
         .where(Event.id == event_id)
-        .options(selectinload(Event.organizer), selectinload(Event.venue), selectinload(Event.tiers))
+        .options(*_event_load_options())
     )
     res = await db.execute(query)
     event = res.scalar_one_or_none()
@@ -378,40 +613,15 @@ async def publish_event(
 
     event.status = EventStatus.PUBLISHED
 
-    # If seated event and no seats generated yet, auto-generate from venue sections
     if event.is_seated and event.venue_id:
-        seat_count_res = await db.execute(
-            select(func.count(Seat.id)).where(Seat.event_id == event.id)
-        )
-        if seat_count_res.scalar_one() == 0:
-            venue_res = await db.execute(
-                select(Venue).where(Venue.id == event.venue_id).options(selectinload(Venue.sections))
-            )
-            venue = venue_res.scalar_one_or_none()
-            if venue and venue.sections:
-                tiers_res = await db.execute(
-                    select(TicketTier)
-                    .where(TicketTier.event_id == event.id, TicketTier.is_active.is_(True))
-                    .order_by(TicketTier.price.asc())
-                )
-                tiers = tiers_res.scalars().all()
-                sections = sorted(venue.sections, key=lambda s: s.name)
-                for idx, section in enumerate(sections):
-                    tier = tiers[idx] if idx < len(tiers) else (tiers[-1] if tiers else None)
-                    for row_idx in range(section.rows):
-                        for seat_num in range(1, section.seats_per_row + 1):
-                            seat = Seat(
-                                section_id=section.id,
-                                event_id=event.id,
-                                tier_id=tier.id if tier else None,
-                                row_label=_row_label(row_idx),
-                                seat_number=seat_num,
-                            )
-                            db.add(seat)
+        await _ensure_event_seats(event, db, force_regenerate=False)
 
     await db.commit()
-    await db.refresh(event)
-    return format_event_response(event)
+
+    refreshed = (
+        await db.execute(select(Event).where(Event.id == event.id).options(*_event_load_options()))
+    ).scalar_one()
+    return format_event_response(refreshed)
 
 
 # Ticket Tier Management Endpoints
@@ -800,18 +1010,131 @@ async def remove_event_staff(
     return {"message": "Staff assignment removed successfully"}
 
 
-# ─── Seat Map Endpoints ────────────────────────────────────────────────────────
+# ─── Seat Map & Timed Hold Endpoints ───────────────────────────────────────────
 
-def _row_label(index: int) -> str:
-    """Convert 0-based row index to alphabetic label (0→A, 25→Z, 26→AA, …)."""
-    result = ""
-    n = index
-    while True:
-        result = string.ascii_uppercase[n % 26] + result
-        n = n // 26 - 1
-        if n < 0:
-            break
-    return result
+async def _expire_stale_holds(event_id: UUID, db: AsyncSession, now: datetime) -> None:
+    """Marks any expired ACTIVE holds for seats in this event as EXPIRED."""
+    event_seat_ids_subq = select(Seat.id).where(Seat.event_id == event_id)
+    await db.execute(
+        update(SeatHold)
+        .where(
+            SeatHold.seat_id.in_(event_seat_ids_subq),
+            SeatHold.status == SeatHoldStatus.ACTIVE,
+            SeatHold.expires_at <= now,
+        )
+        .values(status=SeatHoldStatus.EXPIRED)
+    )
+    await db.flush()
+
+
+async def _build_event_seats_response(
+    event: Event,
+    all_seats: List[Seat],
+    current_user: Optional[User],
+    db: AsyncSession,
+    now: datetime,
+) -> EventSeatsResponse:
+    """Constructs the live EventSeatsResponse with AVAILABLE / HELD / RESERVED states."""
+    reserved_res = await db.execute(
+        select(BookingItem.seat_id)
+        .join(Booking, Booking.id == BookingItem.booking_id)
+        .where(
+            BookingItem.seat_id.is_not(None),
+            Booking.event_id == event.id,
+            Booking.status.in_([BookingStatus.CONFIRMED, BookingStatus.PENDING]),
+        )
+    )
+    reserved_seat_ids = {row[0] for row in reserved_res.fetchall()}
+
+    # Fetch active non-expired holds if hold mode is active (or clean up any lingering active holds)
+    active_holds: Dict[UUID, tuple] = {}
+    my_hold_expires_at: Optional[datetime] = None
+
+    event_seat_ids_subq = select(Seat.id).where(Seat.event_id == event.id)
+    holds_res = await db.execute(
+        select(SeatHold)
+        .where(
+            SeatHold.seat_id.in_(event_seat_ids_subq),
+            SeatHold.status == SeatHoldStatus.ACTIVE,
+            SeatHold.expires_at > now,
+        )
+    )
+    for hold in holds_res.scalars().all():
+        if hold.seat_id:
+            active_holds[hold.seat_id] = (hold.user_id, hold.expires_at)
+            if current_user and hold.user_id == current_user.id:
+                if my_hold_expires_at is None or hold.expires_at < my_hold_expires_at:
+                    my_hold_expires_at = hold.expires_at
+
+    # Group seats by section
+    section_map: Dict[str, List[Seat]] = {}
+    for seat in all_seats:
+        sid = str(seat.section_id)
+        section_map.setdefault(sid, []).append(seat)
+
+    sections_res = await db.execute(
+        select(VenueSection).where(VenueSection.venue_id == event.venue_id)
+    )
+    ordered_sections = sort_sections_front_to_back(list(sections_res.scalars().all()))
+
+    section_groups: List[SeatSectionGroup] = []
+    for section in ordered_sections:
+        sid = str(section.id)
+        seats_in_sec = section_map.get(sid, [])
+        if not seats_in_sec:
+            continue
+
+        seats_sorted = sorted(
+            seats_in_sec,
+            key=lambda x: (len(x.row_label), x.row_label, x.seat_number),
+        )
+        default_tier_id = seats_sorted[0].tier_id if seats_sorted else None
+
+        seat_responses: List[SeatResponse] = []
+        for s in seats_sorted:
+            held_by_me = False
+            hold_exp = None
+            if s.id in reserved_seat_ids:
+                seat_status = "RESERVED"
+            elif s.id in active_holds:
+                holder_id, hold_exp = active_holds[s.id]
+                held_by_me = bool(current_user and holder_id == current_user.id)
+                seat_status = "HELD"
+            else:
+                seat_status = "AVAILABLE"
+
+            seat_responses.append(
+                SeatResponse(
+                    id=s.id,
+                    section_id=s.section_id,
+                    tier_id=s.tier_id,
+                    row_label=s.row_label,
+                    seat_number=s.seat_number,
+                    status=seat_status,
+                    held_by_me=held_by_me,
+                    hold_expires_at=hold_exp,
+                )
+            )
+
+        section_groups.append(
+            SeatSectionGroup(
+                section_id=section.id,
+                section_name=section.name,
+                rows=section.rows,
+                seats_per_row=section.seats_per_row,
+                tier_id=default_tier_id,
+                seats=seat_responses,
+            )
+        )
+
+    return EventSeatsResponse(
+        event_id=event.id,
+        is_seated=True,
+        seat_hold_enabled=bool(event.seat_hold_enabled),
+        my_hold_expires_at=my_hold_expires_at,
+        server_time=now,
+        sections=section_groups,
+    )
 
 
 @router.post("/{event_id}/seats/generate", response_model=EventSeatsResponse, status_code=status.HTTP_201_CREATED)
@@ -821,14 +1144,12 @@ async def generate_seats_for_event(
     db: AsyncSession = Depends(get_db),
 ) -> EventSeatsResponse:
     """
-    Organizer: auto-generate Seat rows for a seated event from its venue sections.
-    Idempotent — clears existing seats first if re-generated.
-    Each section's rows × seats_per_row produces labelled Seat records (Row A–Z, seat 1–N).
+    Organizer: regenerate Seat rows covering the full venue capacity for a seated event.
     """
     query = (
         select(Event)
         .where(Event.id == event_id)
-        .options(selectinload(Event.venue).selectinload(Venue.sections))
+        .options(*_event_load_options())
     )
     res = await db.execute(query)
     event = res.scalar_one_or_none()
@@ -839,84 +1160,35 @@ async def generate_seats_for_event(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
     if not event.is_seated:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot generate seats for a non-seated event")
-    if not event.venue or not event.venue.sections:
+    if not event.venue or event.venue.layout_type != LayoutType.SEATED:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Event's venue has no sections. Add sections to the venue first.",
+            detail="Event must be assigned to a Seated venue before generating seats.",
         )
 
-    # Remove existing seats for this event (safe re-generation)
-    existing_res = await db.execute(select(Seat).where(Seat.event_id == event_id))
-    for existing_seat in existing_res.scalars().all():
-        await db.delete(existing_seat)
-    await db.flush()
-
-    # Find tiers to map sections → tiers (best-effort: sort tiers by price, sections by name)
-    tiers_res = await db.execute(
-        select(TicketTier)
-        .where(TicketTier.event_id == event_id, TicketTier.is_active.is_(True))
-        .order_by(TicketTier.price.asc())
-    )
-    tiers = tiers_res.scalars().all()
-
-    sections = sorted(event.venue.sections, key=lambda s: s.name)
-    section_groups = []
-
-    for idx, section in enumerate(sections):
-        tier = tiers[idx] if idx < len(tiers) else (tiers[-1] if tiers else None)
-        new_seats = []
-
-        for row_idx in range(section.rows):
-            for seat_num in range(1, section.seats_per_row + 1):
-                seat = Seat(
-                    section_id=section.id,
-                    event_id=event_id,
-                    tier_id=tier.id if tier else None,
-                    row_label=_row_label(row_idx),
-                    seat_number=seat_num,
-                )
-                db.add(seat)
-                new_seats.append(seat)
-
-        await db.flush()
-        section_groups.append(SeatSectionGroup(
-            section_id=section.id,
-            section_name=section.name,
-            rows=section.rows,
-            seats_per_row=section.seats_per_row,
-            tier_id=tier.id if tier else None,
-            seats=[SeatResponse(
-                id=s.id,
-                section_id=s.section_id,
-                row_label=s.row_label,
-                seat_number=s.seat_number,
-                status="AVAILABLE",
-            ) for s in new_seats],
-        ))
-
+    all_seats = await _ensure_event_seats(event, db, force_regenerate=True)
     await db.commit()
 
-    return EventSeatsResponse(
-        event_id=event_id,
-        is_seated=True,
-        sections=section_groups,
-    )
+    now = datetime.now(timezone.utc)
+    return await _build_event_seats_response(event, all_seats, current_user, db, now)
 
 
 @router.get("/{event_id}/seats", response_model=EventSeatsResponse)
 async def get_event_seats(
     event_id: UUID,
+    current_user: Optional[User] = Depends(get_optional_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> EventSeatsResponse:
     """
-    Public: returns the full seat map for a seated event.
-    Seat status is computed from active BookingItems (RESERVED) vs database rows (AVAILABLE).
-    Redis holds are not surfaced here for simplicity; a seat disappears from AVAILABLE once booked.
+    Public (with optional auth): returns the full venue seat map and live seat statuses
+    (AVAILABLE, HELD with held_by_me flag, RESERVED). Auto-expires timed holds and
+    syncs seats for seated events that do not yet have seats populated.
     """
+    now = datetime.now(timezone.utc)
     query = (
         select(Event)
         .where(Event.id == event_id)
-        .options(selectinload(Event.venue).selectinload(Venue.sections))
+        .options(*_event_load_options())
     )
     res = await db.execute(query)
     event = res.scalar_one_or_none()
@@ -925,78 +1197,291 @@ async def get_event_seats(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
 
     if not event.is_seated:
-        return EventSeatsResponse(event_id=event_id, is_seated=False, sections=[])
+        return EventSeatsResponse(
+            event_id=event_id,
+            is_seated=False,
+            seat_hold_enabled=False,
+            my_hold_expires_at=None,
+            server_time=now,
+            sections=[],
+        )
 
-    # Fetch all seats for this event
-    seats_res = await db.execute(
-        select(Seat).where(Seat.event_id == event_id).order_by(Seat.row_label, Seat.seat_number)
-    )
-    all_seats = seats_res.scalars().all()
+    await _expire_stale_holds(event_id, db, now)
 
-    # Determine which seat_ids are reserved (confirmed or pending bookings)
-    reserved_res = await db.execute(
-        select(BookingItem.seat_id)
-        .join(Booking, Booking.id == BookingItem.booking_id)
-        .where(
-            BookingItem.seat_id.is_not(None),
-            BookingItem.booking_id.in_(
-                select(Booking.id).where(
-                    Booking.event_id == event_id,
-                    Booking.status.in_([BookingStatus.CONFIRMED, BookingStatus.PENDING]),
-                )
-            ),
+    all_seats = await _ensure_event_seats(event, db, force_regenerate=False)
+    await db.commit()
+
+    return await _build_event_seats_response(event, all_seats, current_user, db, now)
+
+
+@router.delete("/{event_id}/seats/holds", response_model=SeatHoldActionResponse)
+async def release_all_event_holds(
+    event_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> SeatHoldActionResponse:
+    """
+    Releases ALL active seat holds held by the authenticated user for this event,
+    resetting their checkout timer cleanly.
+    """
+    now = datetime.now(timezone.utc)
+    event_seat_ids_subq = select(Seat.id).where(Seat.event_id == event_id)
+
+    active_res = await db.execute(
+        select(SeatHold).where(
+            SeatHold.seat_id.in_(event_seat_ids_subq),
+            SeatHold.user_id == current_user.id,
+            SeatHold.status == SeatHoldStatus.ACTIVE,
         )
     )
-    reserved_seat_ids = {row[0] for row in reserved_res.fetchall()}
+    holds = active_res.scalars().all()
+    for h in holds:
+        h.status = SeatHoldStatus.EXPIRED
+        if h.seat_id:
+            try:
+                await release_seat(str(h.seat_id))
+            except Exception:
+                pass
 
-    # Group seats by section
-    section_map: dict = {}
-    for seat in all_seats:
-        sid = str(seat.section_id)
-        if sid not in section_map:
-            section_map[sid] = []
-        section_map[sid].append(seat)
-
-    # Fetch sections for metadata
-    sections_res = await db.execute(
-        select(VenueSection).where(VenueSection.venue_id == event.venue_id)
+    await db.commit()
+    return SeatHoldActionResponse(
+        seat_id=None,
+        held=False,
+        expires_at=None,
+        server_time=now,
+        active_hold_count=0,
     )
-    sections_by_id = {str(s.id): s for s in sections_res.scalars().all()}
 
-    # Build section groups from tiers
-    tiers_res = await db.execute(
-        select(TicketTier).where(TicketTier.event_id == event_id, TicketTier.is_active.is_(True))
+
+@router.post("/{event_id}/seats/{seat_id}/hold", response_model=SeatHoldActionResponse)
+async def hold_event_seat(
+    event_id: UUID,
+    seat_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> SeatHoldActionResponse:
+    """
+    Acquires a 10-minute competitive hold on a seat.
+    - First clicked seat starts a 10-minute timer.
+    - Additional clicked seats inherit that same existing expiration time (do NOT extend/reset timer).
+    """
+    if current_user.role == UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="System administrators cannot hold attendee seats",
+        )
+
+    now = datetime.now(timezone.utc)
+    event = (await db.execute(select(Event).where(Event.id == event_id))).scalar_one_or_none()
+    if not event:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+    if event.organizer_id == current_user.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Organizers cannot hold seats for their own event")
+    if not event.is_seated or not event.seat_hold_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Timed seat holds are not enabled for this event",
+        )
+    if event.status != EventStatus.PUBLISHED:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Event is not open for booking")
+
+    await _expire_stale_holds(event_id, db, now)
+
+    seat = (
+        await db.execute(select(Seat).where(Seat.id == seat_id, Seat.event_id == event_id))
+    ).scalar_one_or_none()
+    if not seat:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Seat not found for this event")
+
+    # Verify seat isn't permanently booked
+    booked_cnt = (
+        await db.execute(
+            select(func.count(BookingItem.id))
+            .join(Booking, Booking.id == BookingItem.booking_id)
+            .where(
+                BookingItem.seat_id == seat_id,
+                Booking.event_id == event_id,
+                Booking.status.in_([BookingStatus.CONFIRMED, BookingStatus.PENDING]),
+            )
+        )
+    ).scalar_one()
+    if booked_cnt > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Seat {seat.row_label}{seat.seat_number} is already booked.",
+        )
+
+    # Check active holds on this seat
+    existing_seat_hold = (
+        await db.execute(
+            select(SeatHold).where(
+                SeatHold.seat_id == seat_id,
+                SeatHold.status == SeatHoldStatus.ACTIVE,
+                SeatHold.expires_at > now,
+            )
+        )
+    ).scalar_one_or_none()
+
+    event_seat_ids_subq = select(Seat.id).where(Seat.event_id == event_id)
+    my_active_holds = list(
+        (
+            await db.execute(
+                select(SeatHold)
+                .where(
+                    SeatHold.seat_id.in_(event_seat_ids_subq),
+                    SeatHold.user_id == current_user.id,
+                    SeatHold.status == SeatHoldStatus.ACTIVE,
+                    SeatHold.expires_at > now,
+                )
+                .order_by(SeatHold.expires_at.asc())
+            )
+        )
+        .scalars()
+        .all()
     )
-    tiers_by_id = {str(t.id): t for t in tiers_res.scalars().all()}
 
-    section_groups = []
-    for sid, seats in section_map.items():
-        section = sections_by_id.get(sid)
-        # Determine tier from first seat's tier_id
-        tier_id = str(seats[0].tier_id) if seats and seats[0].tier_id else None
+    if existing_seat_hold:
+        if existing_seat_hold.user_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Seat {seat.row_label}{seat.seat_number} is currently held by another attendee.",
+            )
+        # Idempotent: already held by current user
+        return SeatHoldActionResponse(
+            seat_id=seat_id,
+            held=True,
+            expires_at=existing_seat_hold.expires_at,
+            server_time=now,
+            active_hold_count=len(my_active_holds),
+        )
 
-        seat_responses = []
-        for s in sorted(seats, key=lambda x: (x.row_label, x.seat_number)):
-            seat_status = "RESERVED" if s.id in reserved_seat_ids else "AVAILABLE"
-            seat_responses.append(SeatResponse(
-                id=s.id,
-                section_id=s.section_id,
-                row_label=s.row_label,
-                seat_number=s.seat_number,
-                status=seat_status,
-            ))
+    # Determine max seats allowed for this user / tier
+    tier = None
+    if seat.tier_id:
+        tier = (await db.execute(select(TicketTier).where(TicketTier.id == seat.tier_id))).scalar_one_or_none()
 
-        section_groups.append(SeatSectionGroup(
-            section_id=UUID(sid),
-            section_name=section.name if section else sid[:8],
-            rows=section.rows if section else 0,
-            seats_per_row=section.seats_per_row if section else 0,
-            tier_id=UUID(tier_id) if tier_id else None,
-            seats=seat_responses,
-        ))
+    max_per_user = tier.max_per_user if tier else MAX_HELD_SEATS_PER_USER
+    if len(my_active_holds) >= MAX_HELD_SEATS_PER_USER:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"You can hold up to {MAX_HELD_SEATS_PER_USER} seats at a time.",
+        )
+    if tier:
+        holds_in_tier = sum(1 for h in my_active_holds if h.tier_id == tier.id)
+        booked_in_tier = (
+            await db.execute(
+                select(func.coalesce(func.sum(BookingItem.quantity), 0))
+                .join(Booking, Booking.id == BookingItem.booking_id)
+                .where(
+                    Booking.user_id == current_user.id,
+                    Booking.status.in_([BookingStatus.CONFIRMED, BookingStatus.PENDING]),
+                    BookingItem.tier_id == tier.id,
+                )
+            )
+        ).scalar_one() or 0
+        if holds_in_tier + booked_in_tier >= max_per_user:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Maximum {max_per_user} seats allowed per user for tier '{tier.name}'.",
+            )
 
-    return EventSeatsResponse(
-        event_id=event_id,
-        is_seated=True,
-        sections=sorted(section_groups, key=lambda g: g.section_name),
+    # Cart timer anchor: reuse earliest active hold's expires_at if holding >= 1 seat, else start fresh 10-min countdown
+    if my_active_holds:
+        expires_at = my_active_holds[0].expires_at
+    else:
+        expires_at = now + timedelta(minutes=HOLD_DURATION_MINUTES)
+
+    tier_id_for_hold = seat.tier_id
+    if not tier_id_for_hold:
+        fallback_tier = (
+            await db.execute(
+                select(TicketTier).where(TicketTier.event_id == event_id, TicketTier.is_active.is_(True)).limit(1)
+            )
+        ).scalar_one_or_none()
+        if not fallback_tier:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Event has no active ticket tiers")
+        tier_id_for_hold = fallback_tier.id
+
+    hold = SeatHold(
+        seat_id=seat.id,
+        tier_id=tier_id_for_hold,
+        user_id=current_user.id,
+        quantity=1,
+        status=SeatHoldStatus.ACTIVE,
+        expires_at=expires_at,
+    )
+    db.add(hold)
+    await db.commit()
+
+    try:
+        await hold_seat(seat_id=str(seat.id), user_id=str(current_user.id))
+    except Exception:
+        pass
+
+    return SeatHoldActionResponse(
+        seat_id=seat.id,
+        held=True,
+        expires_at=expires_at,
+        server_time=now,
+        active_hold_count=len(my_active_holds) + 1,
+    )
+
+
+@router.delete("/{event_id}/seats/{seat_id}/hold", response_model=SeatHoldActionResponse)
+async def release_event_seat(
+    event_id: UUID,
+    seat_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+) -> SeatHoldActionResponse:
+    """
+    Releases an attendee's hold on a specific seat.
+    If no seats remain held by the user on this event, returns expires_at=None (timer resets).
+    """
+    now = datetime.now(timezone.utc)
+    await _expire_stale_holds(event_id, db, now)
+
+    holds_res = await db.execute(
+        select(SeatHold).where(
+            SeatHold.seat_id == seat_id,
+            SeatHold.user_id == current_user.id,
+            SeatHold.status == SeatHoldStatus.ACTIVE,
+        )
+    )
+    for h in holds_res.scalars().all():
+        h.status = SeatHoldStatus.EXPIRED
+
+    await db.flush()
+
+    try:
+        await release_seat(str(seat_id))
+    except Exception:
+        pass
+
+    event_seat_ids_subq = select(Seat.id).where(Seat.event_id == event_id)
+    remaining_holds = list(
+        (
+            await db.execute(
+                select(SeatHold)
+                .where(
+                    SeatHold.seat_id.in_(event_seat_ids_subq),
+                    SeatHold.user_id == current_user.id,
+                    SeatHold.status == SeatHoldStatus.ACTIVE,
+                    SeatHold.expires_at > now,
+                )
+                .order_by(SeatHold.expires_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    await db.commit()
+
+    return SeatHoldActionResponse(
+        seat_id=seat_id,
+        held=False,
+        expires_at=remaining_holds[0].expires_at if remaining_holds else None,
+        server_time=now,
+        active_hold_count=len(remaining_holds),
     )

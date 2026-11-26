@@ -1,6 +1,6 @@
 import { useState, useEffect, FormEvent } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { ChevronLeft, Plus, Trash2, Loader2, Pencil, Users, UserCheck, BarChart3, ExternalLink } from 'lucide-react'
+import { ChevronLeft, Plus, Trash2, Loader2, Pencil, Users, UserCheck, BarChart3, ExternalLink, Clock, Armchair } from 'lucide-react'
 import { EventCategory, Venue, TicketTier } from '@/types'
 import { eventsApi, venuesApi } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -42,6 +42,7 @@ export function EditEventPage() {
   const [registrationStart, setRegistrationStart] = useState('')
   const [registrationEnd, setRegistrationEnd] = useState('')
   const [isSeated, setIsSeated] = useState(false)
+  const [seatHoldEnabled, setSeatHoldEnabled] = useState(false)
 
   // Venues List
   const [venues, setVenues] = useState<Venue[]>([])
@@ -97,6 +98,7 @@ export function EditEventPage() {
         setRegistrationStart(toLocalISO(eventData.registration_start))
         setRegistrationEnd(toLocalISO(eventData.registration_end))
         setIsSeated(eventData.is_seated)
+        setSeatHoldEnabled(Boolean(eventData.seat_hold_enabled))
 
         setVenues(venuesList || [])
         // Use either dedicated tier list or embedded tiers
@@ -230,7 +232,7 @@ export function EditEventPage() {
         end_datetime: new Date(endDatetime).toISOString(),
         registration_start: registrationStart ? new Date(registrationStart).toISOString() : undefined,
         registration_end: registrationEnd ? new Date(registrationEnd).toISOString() : undefined,
-        is_seated: isSeated,
+        seat_hold_enabled: isSeated ? seatHoldEnabled : false,
       })
 
       toast.success('Event details updated successfully!')
@@ -344,9 +346,9 @@ export function EditEventPage() {
                     <SelectValue placeholder="Select Venue" />
                   </SelectTrigger>
                   <SelectContent>
-                    {venues.map((v) => (
+                    {(isSeated ? venues.filter((v) => v.layout_type === 'SEATED') : venues).map((v) => (
                       <SelectItem key={v.id} value={v.id}>
-                        {v.name} ({v.city})
+                        {v.name} — {v.layout_type === 'SEATED' ? `Seated (${v.total_capacity} seats)` : `General (Cap: ${v.total_capacity})`}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -426,6 +428,38 @@ export function EditEventPage() {
                 />
               </div>
             </div>
+
+            {isSeated && (
+              <div className="pt-4 border-t space-y-3">
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Armchair className="h-4 w-4 text-primary" />
+                  <span>
+                    <strong className="text-foreground">Interactive Seat Map Active:</strong> Full venue seating is enabled for this event.
+                  </span>
+                </div>
+
+                <div className="p-3.5 rounded-lg border bg-muted/30">
+                  <div className="flex items-start space-x-3">
+                    <input
+                      id="editSeatHoldEnabled"
+                      type="checkbox"
+                      checked={seatHoldEnabled}
+                      onChange={(e) => setSeatHoldEnabled(e.target.checked)}
+                      className="h-4 w-4 mt-0.5 rounded border-input text-primary focus:ring-primary"
+                    />
+                    <div className="space-y-1">
+                      <Label htmlFor="editSeatHoldEnabled" className="cursor-pointer flex items-center gap-1.5 font-semibold text-sm">
+                        <Clock className="h-3.5 w-3.5 text-amber-600" />
+                        Enable 10-Minute Competitive Seat Hold Timer
+                      </Label>
+                      <p className="text-xs text-muted-foreground">
+                        When ON, attendees temporarily lock clicked seats for 10 minutes until booking finishes.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
           </CardContent>
         </Card>
 

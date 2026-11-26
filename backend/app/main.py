@@ -4,8 +4,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1.router import api_router
 from app.core.config import settings
-from app.core.database import Base, engine
+from app.core.database import AsyncSessionLocal, Base, engine
 from app.core.redis import close_redis, get_redis
+from app.core.seed_venues import ensure_default_venues
 
 logger = logging.getLogger("uvicorn")
 
@@ -25,6 +26,15 @@ async def lifespan(app: FastAPI):
             logger.info("Database schema checked and tables verified.")
     except Exception as exc:
         logger.warning(f"Database startup verification notice: {exc}")
+
+    # Seed standard UIU venues idempotently
+    try:
+        async with AsyncSessionLocal() as db:
+            seeded = await ensure_default_venues(db)
+            if seeded > 0:
+                logger.info(f"Seeded {seeded} standard campus venues.")
+    except Exception as exc:
+        logger.warning(f"Venue seeding notice: {exc}")
 
     # Check Redis connectivity
     try:

@@ -95,21 +95,38 @@ export function VenuesPage() {
                   </p>
                 )}
 
-                <div className="grid grid-cols-2 gap-2 pt-2 border-t text-xs">
-                  <div className="flex items-center gap-1.5">
-                    <Users className="h-3.5 w-3.5 text-muted-foreground" />
-                    <span>Capacity: <strong>{venue.total_capacity}</strong></span>
+                <div className="space-y-2.5 pt-2 border-t text-xs">
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="flex items-center gap-1.5">
+                      <Users className="h-3.5 w-3.5 text-muted-foreground" />
+                      <span>
+                        {venue.layout_type === 'SEATED' ? 'Seats:' : 'Capacity:'}{' '}
+                        <strong>{venue.total_capacity}</strong>
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      {venue.layout_type === 'SEATED' ? (
+                        <Armchair className="h-3.5 w-3.5 text-muted-foreground" />
+                      ) : (
+                        <Layers className="h-3.5 w-3.5 text-muted-foreground" />
+                      )}
+                      <span>
+                        {venue.layout_type === 'SEATED' && venue.sections?.length
+                          ? `${venue.sections.length} Sections`
+                          : 'Open Floor'}
+                      </span>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-1.5">
-                    {venue.layout_type === 'SEATED' ? (
-                      <Armchair className="h-3.5 w-3.5 text-muted-foreground" />
-                    ) : (
-                      <Layers className="h-3.5 w-3.5 text-muted-foreground" />
-                    )}
-                    <span>
-                      {venue.sections?.length ? `${venue.sections.length} Sections` : 'Single Section'}
-                    </span>
-                  </div>
+
+                  {venue.layout_type === 'SEATED' && venue.sections && venue.sections.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5 pt-1">
+                      {venue.sections.map((sec) => (
+                        <Badge key={sec.id} variant="outline" className="text-[11px] font-normal">
+                          {sec.name}: {sec.rows * sec.seats_per_row} seats
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </CardContent>
             </Card>

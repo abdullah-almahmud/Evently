@@ -1,15 +1,17 @@
 import logging
 import uuid
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import List
+from typing import Dict, List, Set
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db
 from app.core.deps import get_current_active_user
+from app.core.redis import release_seat
 from app.core.security import create_qr_token
 from app.models import (
     Booking,
@@ -18,6 +20,8 @@ from app.models import (
     Event,
     EventStatus,
     Seat,
+    SeatHold,
+    SeatHoldStatus,
     Ticket,
     TicketStatus,
     TicketTier,
@@ -139,50 +143,76 @@ async def create_booking(
     if event.status != EventStatus.PUBLISHED:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Event is not available for booking")
 
+    now = datetime.now(timezone.utc)
+    if event.is_seated and event.seat_hold_enabled:
+        event_seat_ids_subq = select(Seat.id).where(Seat.event_id == data.event_id)
+        await db.execute(
+            update(SeatHold)
+            .where(
+                SeatHold.seat_id.in_(event_seat_ids_subq),
+                SeatHold.status == SeatHoldStatus.ACTIVE,
+                SeatHold.expires_at <= now,
+            )
+            .values(status=SeatHoldStatus.EXPIRED)
+        )
+        await db.flush()
+
     total_amount = Decimal("0.00")
     has_paid = False
     tier_items = []  # list of (tier, quantity, seat_id)
+    tiers_by_id: Dict[UUID, TicketTier] = {}
+    requested_qty_by_tier: Dict[UUID, int] = {}
+    seen_seat_ids: Set[UUID] = set()
+    booked_seat_ids_to_convert: List[UUID] = []
 
     for req_item in data.items:
         if req_item.quantity <= 0:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Quantity must be positive")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Quantity must be positive")
 
-        tier_res = await db.execute(select(TicketTier).where(
-            TicketTier.id == req_item.tier_id,
-            TicketTier.event_id == data.event_id,
-        ))
-        tier = tier_res.scalar_one_or_none()
-        if not tier:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Tier {req_item.tier_id} not found for this event")
+        if req_item.tier_id in tiers_by_id:
+            tier = tiers_by_id[req_item.tier_id]
+        else:
+            tier_res = await db.execute(select(TicketTier).where(
+                TicketTier.id == req_item.tier_id,
+                TicketTier.event_id == data.event_id,
+            ))
+            tier = tier_res.scalar_one_or_none()
+            if not tier:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Tier {req_item.tier_id} not found for this event")
+            tiers_by_id[tier.id] = tier
+
         if not tier.is_active:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Ticket tier '{tier.name}' is not active")
 
-        # Per-user quantity check
-        if req_item.quantity > tier.max_per_user:
+        requested_qty_by_tier[tier.id] = requested_qty_by_tier.get(tier.id, 0) + req_item.quantity
+        cumulative_req = requested_qty_by_tier[tier.id]
+
+        # Per-user cumulative quantity check
+        if cumulative_req > tier.max_per_user:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Cannot book {req_item.quantity} tickets for tier '{tier.name}'. Max per user is {tier.max_per_user}",
+                detail=f"Cannot book {cumulative_req} tickets for tier '{tier.name}'. Max per user is {tier.max_per_user}",
             )
 
-        # Check how many tickets user already holds in CONFIRMED bookings for this tier
+        # Check how many tickets user already holds in CONFIRMED or PENDING bookings for this tier
         existing_qty_res = await db.execute(
             select(func.coalesce(func.sum(BookingItem.quantity), 0))
             .join(Booking, Booking.id == BookingItem.booking_id)
             .where(
                 Booking.user_id == current_user.id,
-                Booking.status == BookingStatus.CONFIRMED,
+                Booking.status.in_([BookingStatus.CONFIRMED, BookingStatus.PENDING]),
                 BookingItem.tier_id == tier.id,
             )
         )
         existing_qty = existing_qty_res.scalar_one() or 0
-        if existing_qty + req_item.quantity > tier.max_per_user:
+        if existing_qty + cumulative_req > tier.max_per_user:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"You already have {existing_qty} ticket(s) for tier '{tier.name}'. Max per user is {tier.max_per_user}",
             )
 
-        # Availability check
-        if tier.available_quantity < req_item.quantity:
+        # Cumulative availability check
+        if tier.available_quantity < cumulative_req:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Not enough tickets available for tier '{tier.name}'. Available: {tier.available_quantity}",
@@ -196,17 +226,32 @@ async def create_booking(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"This is a seated event. You must select a specific seat for tier '{tier.name}'.",
                 )
-            # Validate seat exists and belongs to this event
+            if req_item.seat_id in seen_seat_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Duplicate seat in booking request.",
+                )
+            seen_seat_ids.add(req_item.seat_id)
+
+            # Lock seat row to serialize concurrent bookings for the exact same seat
             seat_res = await db.execute(
-                select(Seat).where(Seat.id == req_item.seat_id, Seat.event_id == data.event_id)
+                select(Seat)
+                .where(Seat.id == req_item.seat_id, Seat.event_id == data.event_id)
+                .with_for_update()
             )
             seat = seat_res.scalar_one_or_none()
             if not seat:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Seat not found or does not belong to this event",
+                    detail="Seat not found or does not belong to this event",
                 )
-            # Check seat isn't already booked (atomic check using a subquery)
+            if seat.tier_id and seat.tier_id != tier.id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Seat {seat.row_label}{seat.seat_number} does not belong to tier '{tier.name}'.",
+                )
+
+            # Check seat isn't already booked
             already_booked_res = await db.execute(
                 select(func.count(BookingItem.id))
                 .join(Booking, Booking.id == BookingItem.booking_id)
@@ -221,6 +266,24 @@ async def create_booking(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=f"Seat {seat.row_label}{seat.seat_number} is already taken. Please choose another seat.",
                 )
+
+            # If competitive holds are active, make sure no OTHER user currently holds this seat
+            if event.seat_hold_enabled:
+                active_hold = (
+                    await db.execute(
+                        select(SeatHold).where(
+                            SeatHold.seat_id == req_item.seat_id,
+                            SeatHold.status == SeatHoldStatus.ACTIVE,
+                            SeatHold.expires_at > now,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if active_hold and active_hold.user_id != current_user.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Seat {seat.row_label}{seat.seat_number} is currently held by another attendee.",
+                    )
+
             # Seated bookings are always qty=1 per item (one seat = one ticket)
             if req_item.quantity != 1:
                 raise HTTPException(
@@ -228,6 +291,7 @@ async def create_booking(
                     detail="For seated events, quantity must be 1 per seat selection",
                 )
             resolved_seat_id = req_item.seat_id
+            booked_seat_ids_to_convert.append(req_item.seat_id)
         # ───────────────────────────────────────────────────────────────────────
 
         tier_items.append((tier, req_item.quantity, resolved_seat_id))
@@ -263,6 +327,23 @@ async def create_booking(
             seat_id=seat_id,
         )
         db.add(item)
+
+    # Convert any active holds held by this user on these seats
+    if booked_seat_ids_to_convert:
+        await db.execute(
+            update(SeatHold)
+            .where(
+                SeatHold.seat_id.in_(booked_seat_ids_to_convert),
+                SeatHold.user_id == current_user.id,
+                SeatHold.status == SeatHoldStatus.ACTIVE,
+            )
+            .values(status=SeatHoldStatus.CONVERTED)
+        )
+        for sid in booked_seat_ids_to_convert:
+            try:
+                await release_seat(str(sid))
+            except Exception:
+                pass
 
     await db.flush()
 

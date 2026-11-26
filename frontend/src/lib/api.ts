@@ -29,6 +29,7 @@ import type {
   AdminOverview,
   UserRole,
   EventSeatsResponse,
+  SeatHoldActionResponse,
 } from '@/types'
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1'
@@ -273,6 +274,21 @@ export const eventsApi = {
 
   generateSeats: async (eventId: string): Promise<EventSeatsResponse> => {
     const res = await api.post<EventSeatsResponse>(`/events/${eventId}/seats/generate`)
+    return res.data
+  },
+
+  holdSeat: async (eventId: string, seatId: string): Promise<SeatHoldActionResponse> => {
+    const res = await api.post<SeatHoldActionResponse>(`/events/${eventId}/seats/${seatId}/hold`)
+    return res.data
+  },
+
+  releaseSeatHold: async (eventId: string, seatId: string): Promise<SeatHoldActionResponse> => {
+    const res = await api.delete<SeatHoldActionResponse>(`/events/${eventId}/seats/${seatId}/hold`)
+    return res.data
+  },
+
+  releaseAllSeatHolds: async (eventId: string): Promise<SeatHoldActionResponse> => {
+    const res = await api.delete<SeatHoldActionResponse>(`/events/${eventId}/seats/holds`)
     return res.data
   },
 }

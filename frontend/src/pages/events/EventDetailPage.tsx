@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import {
   Calendar,
@@ -9,14 +9,11 @@ import {
   Users,
   CheckCircle2,
   Clock,
-  Sparkles,
-  Info,
   Minus,
   Plus,
   ShieldCheck,
   HeartHandshake,
   Loader2,
-  AlertCircle,
   ExternalLink,
   Armchair,
   RefreshCw,
@@ -24,7 +21,7 @@ import {
 import { Event, TicketTier, VolunteerApplication, Booking, Seat, EventSeatsResponse } from '@/types'
 import { eventsApi, bookingsApi, volunteerApi } from '@/lib/api'
 import { SeatMap } from '@/components/events/SeatMap'
-import { formatDateRange, formatCurrency } from '@/lib/utils'
+import { formatDateRange, formatCurrency, cn } from '@/lib/utils'
 import { useAuth } from '@/hooks/useAuth'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -56,6 +53,10 @@ export function EventDetailPage() {
   const [selectedSeats, setSelectedSeats] = useState<Seat[]>([])
   const [eventSeats, setEventSeats] = useState<EventSeatsResponse | null>(null)
   const [isGeneratingSeats, setIsGeneratingSeats] = useState(false)
+  const [pendingSeatId, setPendingSeatId] = useState<string | null>(null)
+  const [holdExpiresAt, setHoldExpiresAt] = useState<string | null>(null)
+  const [serverOffsetMs, setServerOffsetMs] = useState<number>(0)
+  const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null)
   const [isBooking, setIsBooking] = useState(false)
   const [confirmedBooking, setConfirmedBooking] = useState<Booking | null>(null)
   const [bookingSuccessModalOpen, setBookingSuccessModalOpen] = useState(false)
@@ -69,6 +70,53 @@ export function EventDetailPage() {
   const isOrganizerOfThisEvent = Boolean(user && event && user.id === event.organizer_id)
   const canManageThisEvent = Boolean(isOrganizerOfThisEvent || isAdmin)
   const canBookThisEvent = !isAdmin && !isOrganizerOfThisEvent
+
+  const isSeated = Boolean(event?.is_seated)
+  const seatHoldEnabled = Boolean(event?.is_seated && (eventSeats?.seat_hold_enabled ?? event?.seat_hold_enabled))
+
+  const applySeatsSnapshot = useCallback((seatsData: EventSeatsResponse) => {
+    setEventSeats(seatsData)
+    if (seatsData.server_time) {
+      setServerOffsetMs(Date.parse(seatsData.server_time) - Date.now())
+    }
+
+    const allSeatsMap = new Map<string, Seat>()
+    seatsData.sections.forEach((sec) => sec.seats.forEach((s) => allSeatsMap.set(s.id, s)))
+
+    if (seatsData.seat_hold_enabled) {
+      // Server-authoritative holds: synchronize active holds owned by current user
+      const myHeldSeats: Seat[] = []
+      allSeatsMap.forEach((s) => {
+        if (s.status === 'HELD' && s.held_by_me) {
+          myHeldSeats.push(s)
+        }
+      })
+      setSelectedSeats(myHeldSeats)
+      setHoldExpiresAt(myHeldSeats.length > 0 ? seatsData.my_hold_expires_at || null : null)
+    } else {
+      // Standard mode: drop any locally selected seat if another user just booked it
+      setSelectedSeats((prev) => {
+        const filtered = prev.filter((sel) => {
+          const fresh = allSeatsMap.get(sel.id)
+          return fresh && fresh.status !== 'RESERVED'
+        })
+        if (filtered.length < prev.length) {
+          toast.warning('One or more seats you selected were just booked and have been unselected.')
+        }
+        return filtered
+      })
+    }
+  }, [])
+
+  const refreshSeatsSilently = useCallback(async () => {
+    if (!id || !event?.is_seated) return
+    try {
+      const seatsData = await eventsApi.getSeats(id)
+      applySeatsSnapshot(seatsData)
+    } catch {
+      // Silently ignore background polling errors
+    }
+  }, [id, event?.is_seated, applySeatsSnapshot])
 
   const fetchDetails = async () => {
     if (!id) return
@@ -90,14 +138,18 @@ export function EventDetailPage() {
         }
       }
 
-      // If seated event, load seat layout
+      // Only load seat layout if the organizer explicitly enabled interactive seats
       if (eventData.is_seated) {
         try {
           const seatsData = await eventsApi.getSeats(id)
-          setEventSeats(seatsData)
+          applySeatsSnapshot(seatsData)
         } catch (seatErr) {
           console.error('Failed to load event seats:', seatErr)
         }
+      } else {
+        setEventSeats(null)
+        setSelectedSeats([])
+        setHoldExpiresAt(null)
       }
 
       // Check volunteer status if authenticated non-admin and non-organizer
@@ -122,6 +174,53 @@ export function EventDetailPage() {
     fetchDetails()
   }, [id, isAuthenticated])
 
+  // Real-time 5-second seat sync when interactive seats are active on a published event
+  useEffect(() => {
+    if (!event?.is_seated || event.status !== 'PUBLISHED') return
+    const timer = window.setInterval(() => {
+      refreshSeatsSilently()
+    }, 5000)
+    return () => window.clearInterval(timer)
+  }, [event?.is_seated, event?.status, refreshSeatsSilently])
+
+  // Accurate server-synchronized 10-minute hold countdown timer
+  useEffect(() => {
+    if (!seatHoldEnabled || !holdExpiresAt || selectedSeats.length === 0) {
+      setRemainingSeconds(null)
+      return
+    }
+
+    const computeRemaining = () => {
+      const serverNow = Date.now() + serverOffsetMs
+      return Math.max(0, Math.floor((Date.parse(holdExpiresAt) - serverNow) / 1000))
+    }
+
+    const initial = computeRemaining()
+    setRemainingSeconds(initial)
+
+    if (initial <= 0) {
+      setSelectedSeats([])
+      setHoldExpiresAt(null)
+      refreshSeatsSilently()
+      toast.warning('Your 10-minute seat reservation expired. Seats have been released.')
+      return
+    }
+
+    const interval = window.setInterval(() => {
+      const secs = computeRemaining()
+      setRemainingSeconds(secs)
+      if (secs <= 0) {
+        window.clearInterval(interval)
+        setSelectedSeats([])
+        setHoldExpiresAt(null)
+        refreshSeatsSilently()
+        toast.warning('Your 10-minute seat reservation expired. Seats have been released.')
+      }
+    }, 1000)
+
+    return () => window.clearInterval(interval)
+  }, [seatHoldEnabled, holdExpiresAt, selectedSeats.length, serverOffsetMs, refreshSeatsSilently])
+
   const handleShare = () => {
     navigator.clipboard.writeText(window.location.href)
     toast.success('Event link copied to clipboard!')
@@ -135,18 +234,97 @@ export function EventDetailPage() {
     })
   }
 
-  const handleSeatToggle = (seat: Seat) => {
-    setSelectedSeats((prev) => {
-      const exists = prev.some((s) => s.id === seat.id)
-      if (exists) {
-        return prev.filter((s) => s.id !== seat.id)
+  const getSeatTier = (seat: Seat): TicketTier | undefined => {
+    if (seat.tier_id) {
+      const exact = tiers.find((t) => t.id === seat.tier_id)
+      if (exact) return exact
+    }
+    const sec = eventSeats?.sections.find((s) => s.section_id === seat.section_id)
+    if (sec?.tier_id) {
+      const secTier = tiers.find((t) => t.id === sec.tier_id)
+      if (secTier) return secTier
+    }
+    return tiers[0]
+  }
+
+  const handleSeatToggle = async (seat: Seat) => {
+    if (!id || !canBookThisEvent) return
+
+    const isAlreadySelected = selectedSeats.some((s) => s.id === seat.id)
+
+    // Standard mode (no timer): pure local selection until booking confirmation
+    if (!seatHoldEnabled) {
+      if (isAlreadySelected) {
+        setSelectedSeats((prev) => prev.filter((s) => s.id !== seat.id))
+      } else {
+        if (selectedSeats.length >= 4) {
+          toast.warning('You can select a maximum of 4 seats per booking.')
+          return
+        }
+        setSelectedSeats((prev) => [...prev, seat])
       }
-      if (prev.length >= 4) {
-        toast.warning('You can select a maximum of 4 seats per booking.')
-        return prev
+      return
+    }
+
+    // Competitive Timed Hold Mode
+    if (!isAuthenticated) {
+      toast.info('Please log in to hold and book seats.')
+      navigate(`/auth/login?redirect=/events/${id}`)
+      return
+    }
+
+    try {
+      setPendingSeatId(seat.id)
+      if (isAlreadySelected) {
+        const res = await eventsApi.releaseSeatHold(id, seat.id)
+        if (res.server_time) {
+          setServerOffsetMs(Date.parse(res.server_time) - Date.now())
+        }
+        setSelectedSeats((prev) => prev.filter((s) => s.id !== seat.id))
+        // If no held seats remain, reset timer cleanly (expires_at = null)
+        setHoldExpiresAt(res.active_hold_count > 0 ? res.expires_at || null : null)
+        await refreshSeatsSilently()
+      } else {
+        if (selectedSeats.length >= 4) {
+          toast.warning('You can hold a maximum of 4 seats per booking.')
+          return
+        }
+        const res = await eventsApi.holdSeat(id, seat.id)
+        if (res.server_time) {
+          setServerOffsetMs(Date.parse(res.server_time) - Date.now())
+        }
+        if (res.expires_at) {
+          setHoldExpiresAt(res.expires_at)
+        }
+        setSelectedSeats((prev) => (prev.some((s) => s.id === seat.id) ? prev : [...prev, { ...seat, status: 'HELD', held_by_me: true }]))
+        await refreshSeatsSilently()
       }
-      return [...prev, seat]
-    })
+    } catch (err: unknown) {
+      const errorMsg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+        'Could not update seat hold.'
+      toast.error(errorMsg)
+      await refreshSeatsSilently()
+    } finally {
+      setPendingSeatId(null)
+    }
+  }
+
+  const handleClearSeats = async () => {
+    if (!id) return
+    if (!seatHoldEnabled) {
+      setSelectedSeats([])
+      return
+    }
+    try {
+      await eventsApi.releaseAllSeatHolds(id)
+      setSelectedSeats([])
+      setHoldExpiresAt(null)
+      await refreshSeatsSilently()
+    } catch {
+      setSelectedSeats([])
+      setHoldExpiresAt(null)
+    }
   }
 
   const handleGenerateSeats = async () => {
@@ -154,19 +332,17 @@ export function EventDetailPage() {
     try {
       setIsGeneratingSeats(true)
       const data = await eventsApi.generateSeats(id)
-      setEventSeats(data)
-      toast.success('Seating layout generated from venue sections!')
+      applySeatsSnapshot(data)
+      toast.success('Full venue seating layout synchronized!')
     } catch (err: unknown) {
       const errorMsg =
         (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
-        'Failed to generate seats. Ensure the venue has sections configured.'
+        'Failed to generate seats.'
       toast.error(errorMsg)
     } finally {
       setIsGeneratingSeats(false)
     }
   }
-
-  const isSeated = Boolean(event?.is_seated)
 
   const totalTicketsSelected = isSeated
     ? selectedSeats.length
@@ -174,8 +350,7 @@ export function EventDetailPage() {
 
   const totalCost = isSeated
     ? selectedSeats.reduce((sum, seat) => {
-        const sec = eventSeats?.sections.find((s) => s.section_id === seat.section_id)
-        const t = sec?.tier_id ? tiers.find((tier) => tier.id === sec.tier_id) : tiers[0]
+        const t = getSeatTier(seat)
         return sum + Number(t?.price || 0)
       }, 0)
     : tiers.reduce((sum, tier) => {
@@ -203,10 +378,9 @@ export function EventDetailPage() {
         return
       }
       items = selectedSeats.map((seat) => {
-        const sec = eventSeats?.sections.find((s) => s.section_id === seat.section_id)
-        const tierId = sec?.tier_id || tiers[0]?.id
+        const t = getSeatTier(seat)
         return {
-          tier_id: tierId,
+          tier_id: t?.id || tiers[0]?.id,
           quantity: 1,
           seat_id: seat.id,
         }
@@ -233,14 +407,21 @@ export function EventDetailPage() {
       setBookingSuccessModalOpen(true)
       setSelectedQuantities({})
       setSelectedSeats([])
-      toast.success('Booking confirmed! Digital tickets issued.')
-      // Refresh event details to update available quantities
+      setHoldExpiresAt(null)
+      toast.success(
+        booking.status === 'CONFIRMED'
+          ? 'Booking confirmed! Digital tickets issued.'
+          : 'Seats reserved! Check your booking in My Bookings.'
+      )
       fetchDetails()
     } catch (err: unknown) {
       const errorMsg =
         (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
         'Failed to complete booking. Please try again.'
       toast.error(errorMsg)
+      if (isSeated) {
+        refreshSeatsSilently()
+      }
     } finally {
       setIsBooking(false)
     }
@@ -395,7 +576,9 @@ export function EventDetailPage() {
                   {event.venue?.address || 'United City, Madani Avenue, Badda, Dhaka 1212'}
                 </p>
                 <p className="text-muted-foreground text-xs pt-1">
-                  Type: {event.is_seated ? 'Seated Admission' : 'General Admission'}
+                  {event.is_seated
+                    ? `Seated Venue • ${event.venue?.total_capacity ? `${event.venue.total_capacity} total seats` : 'Assigned seating'}`
+                    : `General Admission${event.venue?.total_capacity ? ` • Cap: ${event.venue.total_capacity}` : ''}`}
                 </p>
               </CardContent>
             </Card>
@@ -418,17 +601,19 @@ export function EventDetailPage() {
             </Card>
           </div>
 
-          {/* Seating Map Card for Seated Events */}
+          {/* Seating Map Card — strictly rendered ONLY when organizer opted into interactive seats */}
           {event.is_seated && (
             <Card className="border-primary/20 shadow-sm">
-              <CardHeader className="pb-3 flex flex-row items-center justify-between">
+              <CardHeader className="pb-3 flex flex-row items-center justify-between gap-2">
                 <div>
                   <CardTitle className="text-lg flex items-center gap-2">
                     <Armchair className="h-5 w-5 text-primary" />
                     Interactive Seat Selection
                   </CardTitle>
                   <CardDescription className="text-xs">
-                    Choose your exact seats from the venue layout below
+                    {seatHoldEnabled
+                      ? 'Clicking a seat places a 10-minute temporary hold until you confirm your booking'
+                      : 'Choose your exact seats from the venue layout below'}
                   </CardDescription>
                 </div>
                 {canManageThisEvent && (
@@ -438,14 +623,14 @@ export function EventDetailPage() {
                     size="sm"
                     onClick={handleGenerateSeats}
                     disabled={isGeneratingSeats}
-                    className="gap-1.5 text-xs h-8"
+                    className="gap-1.5 text-xs h-8 shrink-0"
                   >
                     {isGeneratingSeats ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin" />
                     ) : (
                       <RefreshCw className="h-3.5 w-3.5" />
                     )}
-                    Generate / Reset Seats
+                    Sync Venue Seats
                   </Button>
                 )}
               </CardHeader>
@@ -457,6 +642,9 @@ export function EventDetailPage() {
                   onSeatToggle={handleSeatToggle}
                   maxSelectable={4}
                   disabled={!canBookThisEvent}
+                  seatHoldEnabled={seatHoldEnabled}
+                  remainingSeconds={remainingSeconds}
+                  pendingSeatId={pendingSeatId}
                 />
               </CardContent>
             </Card>
@@ -555,12 +743,14 @@ export function EventDetailPage() {
           <Card className="sticky top-24 border-primary/20 shadow-md">
             <CardHeader className="pb-4">
               <CardTitle className="text-lg flex items-center justify-between">
-                <span>{isSeated ? 'Reserved Seats' : 'Select Tickets'}</span>
+                <span>{isSeated ? 'Selected Seats' : 'Select Tickets'}</span>
                 {isSeated ? <Armchair className="h-5 w-5 text-primary" /> : <Ticket className="h-5 w-5 text-primary" />}
               </CardTitle>
               <CardDescription className="text-xs">
                 {isSeated
-                  ? 'Select seats from the floor plan to complete booking'
+                  ? seatHoldEnabled
+                    ? 'First seat click holds your picks for 10 minutes'
+                    : 'Select seats from the floor plan to complete booking'
                   : 'Select quantities for your desired passes'}
               </CardDescription>
             </CardHeader>
@@ -568,6 +758,29 @@ export function EventDetailPage() {
             <CardContent className="space-y-4">
               {isSeated ? (
                 <div className="space-y-4">
+                  {/* Subtle, visible sticky countdown timer when holding seats */}
+                  {seatHoldEnabled && selectedSeats.length > 0 && remainingSeconds !== null && (
+                    <div
+                      className={cn(
+                        'flex items-center justify-between rounded-lg border px-3 py-2 text-xs font-medium transition-colors',
+                        remainingSeconds <= 60
+                          ? 'bg-rose-500/10 border-rose-500/30 text-rose-700 dark:text-rose-300'
+                          : remainingSeconds <= 180
+                          ? 'bg-amber-500/10 border-amber-500/30 text-amber-800 dark:text-amber-300'
+                          : 'bg-blue-500/10 border-blue-500/30 text-blue-800 dark:text-blue-300'
+                      )}
+                    >
+                      <span className="flex items-center gap-1.5">
+                        <Clock className="h-3.5 w-3.5" />
+                        Seat hold expires in
+                      </span>
+                      <span className="font-mono font-bold text-sm tabular-nums">
+                        {String(Math.floor(remainingSeconds / 60)).padStart(2, '0')}:
+                        {String(remainingSeconds % 60).padStart(2, '0')}
+                      </span>
+                    </div>
+                  )}
+
                   {selectedSeats.length > 0 ? (
                     <div className="space-y-2.5">
                       <div className="flex items-center justify-between text-xs font-medium">
@@ -577,7 +790,7 @@ export function EventDetailPage() {
                           variant="ghost"
                           size="sm"
                           className="h-6 px-1.5 text-[11px] text-muted-foreground hover:text-destructive"
-                          onClick={() => setSelectedSeats([])}
+                          onClick={handleClearSeats}
                         >
                           Clear all
                         </Button>
@@ -586,11 +799,11 @@ export function EventDetailPage() {
                       <div className="space-y-1.5 max-h-52 overflow-y-auto pr-0.5">
                         {selectedSeats.map((seat) => {
                           const sec = eventSeats?.sections.find((s) => s.section_id === seat.section_id)
-                          const t = sec?.tier_id ? tiers.find((tier) => tier.id === sec.tier_id) : tiers[0]
+                          const t = getSeatTier(seat)
                           return (
                             <div
                               key={seat.id}
-                              className="flex items-center justify-between text-xs p-2 rounded-lg bg-muted/40 border"
+                              className="flex items-center justify-between text-xs p-2 rounded-lg bg-blue-500/5 border border-blue-500/20"
                             >
                               <div>
                                 <span className="font-semibold text-foreground">
@@ -608,6 +821,7 @@ export function EventDetailPage() {
                                   type="button"
                                   variant="ghost"
                                   size="icon"
+                                  disabled={pendingSeatId === seat.id}
                                   className="h-5 w-5 text-muted-foreground hover:text-destructive p-0"
                                   onClick={() => handleSeatToggle(seat)}
                                 >
@@ -623,7 +837,11 @@ export function EventDetailPage() {
                     <div className="rounded-lg border border-dashed p-4 text-center text-xs text-muted-foreground space-y-1">
                       <Armchair className="mx-auto h-6 w-6 text-muted-foreground/40 mb-1" />
                       <p className="font-medium text-foreground">No seats selected</p>
-                      <p>Click on green seats in the Interactive Seat Selection map above.</p>
+                      <p>
+                        {seatHoldEnabled
+                          ? 'Click green seats on the map to reserve them for 10 minutes.'
+                          : 'Click green seats in the Interactive Seat Selection map.'}
+                      </p>
                     </div>
                   )}
 
@@ -858,9 +1076,19 @@ export function EventDetailPage() {
             <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-600 mb-2">
               <CheckCircle2 className="h-8 w-8" />
             </div>
-            <DialogTitle className="text-center text-xl">Booking Confirmed!</DialogTitle>
+            <DialogTitle className="text-center text-xl">
+              {confirmedBooking?.status === 'CONFIRMED' ? 'Booking Confirmed!' : 'Seats Reserved — Pending Payment'}
+            </DialogTitle>
             <DialogDescription className="text-center">
-              Your tickets for <strong className="text-foreground">{event.title}</strong> have been confirmed and issued with cryptographic QR passes.
+              {confirmedBooking?.status === 'CONFIRMED' ? (
+                <>
+                  Your tickets for <strong className="text-foreground">{event.title}</strong> have been confirmed and issued with cryptographic QR passes.
+                </>
+              ) : (
+                <>
+                  Your booking for <strong className="text-foreground">{event.title}</strong> is saved under My Bookings awaiting payment confirmation.
+                </>
+              )}
             </DialogDescription>
           </DialogHeader>
 

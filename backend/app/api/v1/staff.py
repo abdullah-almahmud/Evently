@@ -8,7 +8,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.database import get_db
 from app.core.deps import get_current_active_user
-from app.models import Event, EventStaff, User
+from app.models import Event, EventStaff, User, Venue
 from app.schemas.event import EventResponse
 from app.schemas.staff import StaffResponse
 
@@ -29,7 +29,7 @@ async def get_my_staff_events(
         .where(EventStaff.user_id == current_user.id)
         .options(
             selectinload(EventStaff.event).selectinload(Event.organizer),
-            selectinload(EventStaff.event).selectinload(Event.venue),
+            selectinload(EventStaff.event).selectinload(Event.venue).selectinload(Venue.sections),
             selectinload(EventStaff.event).selectinload(Event.tiers),
         )
         .order_by(EventStaff.created_at.desc())

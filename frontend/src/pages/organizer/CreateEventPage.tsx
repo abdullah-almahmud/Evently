@@ -5,6 +5,8 @@ import {
   Plus,
   Trash2,
   Loader2,
+  Armchair,
+  Clock,
 } from 'lucide-react'
 import { EventCategory, Venue } from '@/types'
 import { eventsApi, venuesApi } from '@/lib/api'
@@ -44,6 +46,8 @@ export function CreateEventPage() {
   const [registrationStart, setRegistrationStart] = useState('')
   const [registrationEnd, setRegistrationEnd] = useState('')
   const [isSeated, setIsSeated] = useState(false)
+  const [seatHoldEnabled, setSeatHoldEnabled] = useState(false)
+  const [hasCustomizedTiers, setHasCustomizedTiers] = useState(false)
 
   // Venues List
   const [venues, setVenues] = useState<Venue[]>([])
@@ -62,6 +66,9 @@ export function CreateEventPage() {
 
   const [isSubmitting, setIsSubmitting] = useState(false)
 
+  const selectedVenue = venues.find((v) => v.id === venueId)
+  const venueSupportsSeats = selectedVenue?.layout_type === 'SEATED'
+
   useEffect(() => {
     const fetchVenues = async () => {
       try {
@@ -70,6 +77,11 @@ export function CreateEventPage() {
         setVenues(data || [])
         if (data && data.length > 0) {
           setVenueId(data[0].id)
+          setTiers((prev) =>
+            prev.length === 1 && prev[0].name === 'General Admission'
+              ? [{ ...prev[0], total_quantity: data[0].total_capacity }]
+              : prev
+          )
         }
       } catch (err) {
         console.warn('Could not fetch venues:', err)
@@ -80,7 +92,23 @@ export function CreateEventPage() {
     fetchVenues()
   }, [])
 
+  const handleVenueChange = (newVenueId: string) => {
+    setVenueId(newVenueId)
+    const nextVenue = venues.find((v) => v.id === newVenueId)
+    if (!nextVenue) return
+
+    if (nextVenue.layout_type !== 'SEATED') {
+      setIsSeated(false)
+      setSeatHoldEnabled(false)
+    }
+
+    if (!hasCustomizedTiers && tiers.length === 1) {
+      setTiers((prev) => [{ ...prev[0], total_quantity: nextVenue.total_capacity }])
+    }
+  }
+
   const addTier = () => {
+    setHasCustomizedTiers(true)
     setTiers([
       ...tiers,
       {
@@ -98,10 +126,12 @@ export function CreateEventPage() {
       toast.warning('Event must have at least one ticket tier.')
       return
     }
+    setHasCustomizedTiers(true)
     setTiers(tiers.filter((_, i) => i !== index))
   }
 
   const updateTierField = (index: number, field: keyof TierFormItem, value: string | number) => {
+    setHasCustomizedTiers(true)
     const updated = [...tiers]
     updated[index] = {
       ...updated[index],
@@ -135,6 +165,8 @@ export function CreateEventPage() {
       }
     }
 
+    const finalIsSeated = venueSupportsSeats ? isSeated : false
+
     try {
       setIsSubmitting(true)
       await eventsApi.createEvent({
@@ -147,7 +179,8 @@ export function CreateEventPage() {
         end_datetime: new Date(endDatetime).toISOString(),
         registration_start: registrationStart ? new Date(registrationStart).toISOString() : undefined,
         registration_end: registrationEnd ? new Date(registrationEnd).toISOString() : undefined,
-        is_seated: isSeated,
+        is_seated: finalIsSeated,
+        seat_hold_enabled: finalIsSeated ? seatHoldEnabled : false,
         ticket_tiers: tiers.map((t) => ({
           name: t.name.trim(),
           description: t.description.trim() || undefined,
@@ -235,7 +268,7 @@ export function CreateEventPage() {
                 </div>
                 <Select
                   value={venueId}
-                  onValueChange={setVenueId}
+                  onValueChange={handleVenueChange}
                   disabled={isLoadingVenues || venues.length === 0}
                 >
                   <SelectTrigger id="venue">
@@ -244,11 +277,22 @@ export function CreateEventPage() {
                   <SelectContent>
                     {venues.map((v) => (
                       <SelectItem key={v.id} value={v.id}>
-                        {v.name} ({v.city}) — Cap: {v.total_capacity}
+                        {v.name} — {v.layout_type === 'SEATED' ? `Seated (${v.total_capacity} seats)` : `General Admission (Cap: ${v.total_capacity})`}
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
+                {selectedVenue && (
+                  <p className="text-[11px] text-muted-foreground">
+                    {venueSupportsSeats
+                      ? `Seated venue with ${selectedVenue.total_capacity} total seats${
+                          selectedVenue.sections?.length
+                            ? ` (${selectedVenue.sections.map((s) => `${s.name}: ${s.rows * s.seats_per_row}`).join(', ')})`
+                            : ''
+                        }.`
+                      : 'General Admission venue (open floor / non-seated).'}
+                  </p>
+                )}
               </div>
             </div>
 
@@ -332,18 +376,58 @@ export function CreateEventPage() {
               </div>
             </div>
 
-            <div className="flex items-center space-x-3 pt-3 border-t">
-              <input
-                id="isSeated"
-                type="checkbox"
-                checked={isSeated}
-                onChange={(e) => setIsSeated(e.target.checked)}
-                className="h-4 w-4 rounded border-input text-primary focus:ring-primary"
-              />
-              <Label htmlFor="isSeated" className="cursor-pointer">
-                Seated Layout (Assign specific rows and seat numbers for attendees)
-              </Label>
-            </div>
+            {venueSupportsSeats && (
+              <div className="pt-4 border-t space-y-3">
+                <div className="flex items-start space-x-3">
+                  <input
+                    id="isSeated"
+                    type="checkbox"
+                    checked={isSeated}
+                    onChange={(e) => {
+                      const checked = e.target.checked
+                      setIsSeated(checked)
+                      if (!checked) setSeatHoldEnabled(false)
+                    }}
+                    className="h-4 w-4 mt-0.5 rounded border-input text-primary focus:ring-primary"
+                  />
+                  <div className="space-y-1">
+                    <Label htmlFor="isSeated" className="cursor-pointer flex items-center gap-1.5 font-semibold">
+                      <Armchair className="h-4 w-4 text-primary" />
+                      Enable Interactive Seat Map (Optional)
+                    </Label>
+                    <p className="text-xs text-muted-foreground">
+                      Renders the full {selectedVenue?.total_capacity}-seat layout so attendees pick exact seats.{' '}
+                      <span className="font-medium text-foreground">
+                        Note: If left unchecked, this event permanently remains General Admission.
+                      </span>
+                    </p>
+                  </div>
+                </div>
+
+                {isSeated && (
+                  <div className="ml-7 p-3.5 rounded-lg border bg-muted/30 space-y-2">
+                    <div className="flex items-start space-x-3">
+                      <input
+                        id="seatHoldEnabled"
+                        type="checkbox"
+                        checked={seatHoldEnabled}
+                        onChange={(e) => setSeatHoldEnabled(e.target.checked)}
+                        className="h-4 w-4 mt-0.5 rounded border-input text-primary focus:ring-primary"
+                      />
+                      <div className="space-y-1">
+                        <Label htmlFor="seatHoldEnabled" className="cursor-pointer flex items-center gap-1.5 font-semibold text-sm">
+                          <Clock className="h-3.5 w-3.5 text-amber-600" />
+                          Enable 10-Minute Competitive Seat Hold Timer
+                        </Label>
+                        <p className="text-xs text-muted-foreground">
+                          When ON, clicking a seat immediately holds it for 10 minutes with a live countdown so others cannot snatch it mid-checkout. Leave OFF for standard seat selection without a timer.
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -352,7 +436,11 @@ export function CreateEventPage() {
           <CardHeader className="flex flex-row items-center justify-between">
             <div>
               <CardTitle className="text-lg">Ticket Tiers & Passes</CardTitle>
-              <CardDescription>Define prices and quantity limits for registration</CardDescription>
+              <CardDescription>
+                {venueSupportsSeats && isSeated
+                  ? `Higher-priced tiers automatically map to front rows across all ${selectedVenue?.total_capacity} venue seats`
+                  : 'Define prices and quantity limits for registration'}
+              </CardDescription>
             </div>
             <Button type="button" variant="outline" size="sm" onClick={addTier} className="gap-1.5">
               <Plus className="h-4 w-4" />
@@ -360,6 +448,16 @@ export function CreateEventPage() {
             </Button>
           </CardHeader>
           <CardContent className="space-y-4">
+            {venueSupportsSeats && isSeated && selectedVenue && (
+              <div className="rounded-lg border border-primary/20 bg-primary/5 p-3 text-xs text-muted-foreground">
+                <strong className="text-foreground">Full-Venue Seating Sync:</strong> All{' '}
+                <strong>{selectedVenue.total_capacity}</strong> seats in{' '}
+                <strong className="text-foreground">{selectedVenue.name}</strong> will be rendered
+                {selectedVenue.sections?.length
+                  ? ` (${selectedVenue.sections.map((s) => `${s.name}: ${s.rows * s.seats_per_row}`).join(' + ')})`
+                  : ''}. Seat counts per tier sync cleanly to match each venue section.
+              </div>
+            )}
             {tiers.map((tier, idx) => (
               <div
                 key={idx}

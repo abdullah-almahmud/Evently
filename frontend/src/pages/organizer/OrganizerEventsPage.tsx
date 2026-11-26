@@ -167,10 +167,22 @@ export function OrganizerEventsPage() {
                         <td className="py-3 px-4 font-medium text-foreground">
                           <Link
                             to={`/events/${event.id}`}
-                            className="hover:text-primary transition-colors hover:underline"
+                            className="hover:text-primary transition-colors hover:underline block"
                           >
                             {event.title}
                           </Link>
+                          {event.is_seated && (
+                            <div className="flex items-center gap-1 mt-1">
+                              <Badge variant="outline" className="text-[10px] py-0 px-1.5 font-normal">
+                                Interactive Seats
+                              </Badge>
+                              {event.seat_hold_enabled && (
+                                <Badge variant="secondary" className="text-[10px] py-0 px-1.5 font-normal">
+                                  10m Hold Timer
+                                </Badge>
+                              )}
+                            </div>
+                          )}
                         </td>
                         <td className="py-3 px-4">{getStatusBadge(event.status)}</td>
                         <td className="py-3 px-4">

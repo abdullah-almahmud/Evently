@@ -87,6 +87,7 @@ export interface Event {
   registration_end?: string | null
   status: EventStatus
   is_seated: boolean
+  seat_hold_enabled?: boolean
   created_at: string
   updated_at?: string
   // Optional enriched relations
@@ -162,9 +163,12 @@ export interface BookingCreateItem {
 export interface Seat {
   id: string
   section_id: string
+  tier_id?: string | null
   row_label: string
   seat_number: number
   status: 'AVAILABLE' | 'RESERVED' | 'HELD'
+  held_by_me?: boolean
+  hold_expires_at?: string | null
 }
 
 export interface SeatSectionGroup {
@@ -179,7 +183,18 @@ export interface SeatSectionGroup {
 export interface EventSeatsResponse {
   event_id: string
   is_seated: boolean
+  seat_hold_enabled?: boolean
+  my_hold_expires_at?: string | null
+  server_time?: string | null
   sections: SeatSectionGroup[]
+}
+
+export interface SeatHoldActionResponse {
+  seat_id?: string | null
+  held: boolean
+  expires_at?: string | null
+  server_time: string
+  active_hold_count: number
 }
 
 export interface CreateBookingRequest {
@@ -270,6 +285,7 @@ export interface CreateEventRequest {
   registration_start?: string
   registration_end?: string
   is_seated: boolean
+  seat_hold_enabled?: boolean
   ticket_tiers?: Array<{
     name: string
     description?: string

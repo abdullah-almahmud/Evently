@@ -1,5 +1,5 @@
 import uuid
-from typing import Callable
+from typing import Callable, Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import select
@@ -10,6 +10,7 @@ from app.models import User, UserRole
 
 # OAuth2 scheme for JWT bearer authentication
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+optional_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 
 
 async def get_current_user(
@@ -95,4 +96,27 @@ async def get_current_organizer(
 async def get_current_admin(
     user: User = Depends(require_role(UserRole.ADMIN)),
 ) -> User:
+    return user
+
+
+async def get_optional_current_user(
+    token: Optional[str] = Depends(optional_oauth2_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> Optional[User]:
+    """Returns the authenticated active user if a valid token is present, otherwise None."""
+    if not token:
+        return None
+    try:
+        payload = decode_token(token)
+        user_id_str = payload.get("sub")
+        if not user_id_str:
+            return None
+        user_id = uuid.UUID(user_id_str)
+    except Exception:
+        return None
+
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if user is None or not user.is_active:
+        return None
     return user

@@ -1,11 +1,12 @@
 from typing import List
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import inspect as sa_inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from app.core.database import get_db
 from app.core.deps import get_current_organizer
+from app.core.seating import build_generic_sections_for_capacity, sort_sections_front_to_back
 from app.models import LayoutType, User, Venue, VenueSection
 from app.schemas.venue import (
     VenueCreate,
@@ -18,8 +19,14 @@ from app.schemas.venue import (
 router = APIRouter()
 
 
+MAX_SEATED_CAPACITY = 500
+
+
 def format_venue_response(venue: Venue) -> VenueResponse:
-    """Helper to convert Venue model to VenueResponse schema with sections."""
+    """Helper to convert Venue model to VenueResponse schema with front-to-back sections."""
+    unloaded = sa_inspect(venue).unloaded
+    raw_sections = [] if "sections" in unloaded else list(venue.sections or [])
+    ordered_sections = sort_sections_front_to_back(raw_sections)
     return VenueResponse(
         id=venue.id,
         name=venue.name,
@@ -30,7 +37,7 @@ def format_venue_response(venue: Venue) -> VenueResponse:
         description=venue.description,
         created_by=venue.created_by,
         created_at=venue.created_at,
-        sections=[VenueSectionResponse.model_validate(s) for s in (venue.sections or [])],
+        sections=[VenueSectionResponse.model_validate(s) for s in ordered_sections],
     )
 
 
@@ -46,7 +53,7 @@ async def list_venues(
     query = (
         select(Venue)
         .options(selectinload(Venue.sections))
-        .order_by(Venue.name.asc())
+        .order_by(Venue.layout_type.asc(), Venue.total_capacity.asc(), Venue.name.asc())
     )
     result = await db.execute(query)
     venues = result.scalars().all()
@@ -61,19 +68,52 @@ async def create_venue(
 ) -> VenueResponse:
     """
     Registers a new venue or facility on campus.
+    For SEATED venues, automatically persists supplied sections or generates generic
+    auditorium sections matching total_capacity (up to 500 interactive seats).
     """
+    section_specs = []
+    resolved_capacity = data.total_capacity
+
+    if data.layout_type == LayoutType.SEATED:
+        if data.sections:
+            section_specs = [
+                {"name": s.name, "rows": s.rows, "seats_per_row": s.seats_per_row}
+                for s in data.sections
+            ]
+            resolved_capacity = sum(s["rows"] * s["seats_per_row"] for s in section_specs)
+        else:
+            section_specs = build_generic_sections_for_capacity(data.total_capacity)
+            resolved_capacity = sum(s["rows"] * s["seats_per_row"] for s in section_specs)
+
+        if resolved_capacity > MAX_SEATED_CAPACITY:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Seated interactive venues support up to {MAX_SEATED_CAPACITY} seats. Use General Admission for larger capacities.",
+            )
+
     venue = Venue(
         name=data.name,
         address=data.address,
         city=data.city,
-        total_capacity=data.total_capacity,
+        total_capacity=resolved_capacity,
         layout_type=data.layout_type,
         description=data.description,
         created_by=current_user.id,
     )
     db.add(venue)
+    await db.flush()
+
+    for spec in section_specs:
+        db.add(
+            VenueSection(
+                venue_id=venue.id,
+                name=spec["name"],
+                rows=spec["rows"],
+                seats_per_row=spec["seats_per_row"],
+            )
+        )
+
     await db.commit()
-    await db.refresh(venue)
 
     query = select(Venue).where(Venue.id == venue.id).options(selectinload(Venue.sections))
     res = await db.execute(query)
