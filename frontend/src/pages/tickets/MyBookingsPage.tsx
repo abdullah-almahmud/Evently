@@ -11,6 +11,7 @@ import {
   ChevronDown,
   ChevronUp,
   Compass,
+  CreditCard,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -22,7 +23,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { bookingsApi } from '@/lib/api'
+import { bookingsApi, paymentsApi } from '@/lib/api'
 import type { Booking, BookingStatus } from '@/types'
 import { toast } from 'sonner'
 
@@ -55,6 +56,9 @@ export function MyBookingsPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [cancellingId, setCancellingId] = useState<string | null>(null)
   const [confirmCancelId, setConfirmCancelId] = useState<string | null>(null)
+  const [payingBooking, setPayingBooking] = useState<Booking | null>(null)
+  const [paymentMethod, setPaymentMethod] = useState('bKash (Sandbox)')
+  const [isPaying, setIsPaying] = useState(false)
 
   const fetchBookings = async () => {
     try {
@@ -85,6 +89,29 @@ export function MyBookingsPage() {
     } finally {
       setCancellingId(null)
       setConfirmCancelId(null)
+    }
+  }
+
+  const handleCompletePayment = async () => {
+    if (!payingBooking) return
+    try {
+      setIsPaying(true)
+      const initRes = await paymentsApi.initiate(payingBooking.id, paymentMethod)
+      if (initRes.mode === 'sslcommerz' && initRes.gateway_url) {
+        window.location.href = initRes.gateway_url
+        return
+      }
+      const updated = await paymentsApi.confirm(payingBooking.id, paymentMethod)
+      setBookings((prev) => prev.map((b) => (b.id === updated.id ? updated : b)))
+      setPayingBooking(null)
+      toast.success('Payment verified! Your QR entry tickets are now available in My Tickets.')
+    } catch (err: unknown) {
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+        'Payment confirmation failed. Please try again.'
+      toast.error(msg)
+    } finally {
+      setIsPaying(false)
     }
   }
 
@@ -182,7 +209,25 @@ export function MyBookingsPage() {
                           : `৳${Number(booking.total_amount).toLocaleString()}`}
                       </div>
 
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap justify-end">
+                        {booking.status === 'PENDING' && Number(booking.total_amount) > 0 && (
+                          <Button
+                            size="sm"
+                            className="h-8 gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white"
+                            onClick={() => setPayingBooking(booking)}
+                          >
+                            <CreditCard className="h-3.5 w-3.5" />
+                            Pay &amp; Get Tickets
+                          </Button>
+                        )}
+                        {booking.status === 'CONFIRMED' && (
+                          <Button size="sm" variant="secondary" className="h-8 gap-1" asChild>
+                            <Link to="/tickets">
+                              <TicketIcon className="h-3.5 w-3.5" />
+                              View QR Tickets
+                            </Link>
+                          </Button>
+                        )}
                         {canCancel && (
                           <Button
                             size="sm"
@@ -303,6 +348,93 @@ export function MyBookingsPage() {
               Cancel Booking
             </Button>
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Complete Payment Dialog */}
+      <Dialog
+        open={Boolean(payingBooking)}
+        onOpenChange={(open) => !open && !isPaying && setPayingBooking(null)}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <CreditCard className="h-5 w-5 text-emerald-600" />
+              Complete Payment
+            </DialogTitle>
+            <DialogDescription>
+              Confirm payment for{' '}
+              <strong className="text-foreground">
+                {payingBooking?.event?.title || 'your booking'}
+              </strong>{' '}
+              to issue your digital QR passes under My Tickets.
+            </DialogDescription>
+          </DialogHeader>
+
+          {payingBooking && (
+            <div className="space-y-4 pt-1">
+              <div className="p-3.5 rounded-xl border bg-muted/40 text-xs space-y-1.5">
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Booking ID:</span>
+                  <span className="font-mono font-medium">#{payingBooking.id.slice(0, 8)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Total Payable:</span>
+                  <span className="font-bold text-primary">
+                    ৳{Number(payingBooking.total_amount).toLocaleString()}
+                  </span>
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <p className="text-xs font-medium">Payment Method (Sandbox Checkout)</p>
+                <div className="grid grid-cols-3 gap-2">
+                  {['bKash (Sandbox)', 'Nagad (Sandbox)', 'Card (Visa/MC)'].map((m) => (
+                    <button
+                      key={m}
+                      type="button"
+                      onClick={() => setPaymentMethod(m)}
+                      className={`px-2.5 py-2 rounded-lg border text-xs font-medium transition-colors ${
+                        paymentMethod === m
+                          ? 'border-primary bg-primary/10 text-primary'
+                          : 'border-border hover:bg-muted/50 text-muted-foreground'
+                      }`}
+                    >
+                      {m.split(' ')[0]}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex gap-3 pt-1">
+                <Button
+                  variant="outline"
+                  className="flex-1"
+                  disabled={isPaying}
+                  onClick={() => setPayingBooking(null)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white gap-1.5"
+                  disabled={isPaying}
+                  onClick={handleCompletePayment}
+                >
+                  {isPaying ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Confirming...
+                    </>
+                  ) : (
+                    <>
+                      <CheckCircle2 className="h-4 w-4" />
+                      Confirm Payment
+                    </>
+                  )}
+                </Button>
+              </div>
+            </div>
+          )}
         </DialogContent>
       </Dialog>
     </div>

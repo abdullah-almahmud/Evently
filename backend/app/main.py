@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal, Base, engine
-from app.core.redis import close_redis, get_redis
+from app.core.redis import close_redis, get_redis, mark_redis_unavailable
 from app.core.seed_venues import ensure_default_venues
 
 logger = logging.getLogger("uvicorn")
@@ -36,13 +36,14 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning(f"Venue seeding notice: {exc}")
 
-    # Check Redis connectivity
+    # Check Redis connectivity (fail fast & trip circuit breaker if offline)
     try:
         client = get_redis()
         await client.ping()
         logger.info("Redis connection successfully established.")
     except Exception as exc:
-        logger.warning(f"Redis startup connection notice: {exc}")
+        mark_redis_unavailable()
+        logger.warning(f"Redis offline ({exc}); using PostgreSQL-backed seat holds directly.")
 
     yield
 

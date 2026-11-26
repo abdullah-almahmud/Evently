@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import {
   Calendar,
@@ -17,9 +17,10 @@ import {
   ExternalLink,
   Armchair,
   RefreshCw,
+  CreditCard,
 } from 'lucide-react'
 import { Event, TicketTier, VolunteerApplication, Booking, Seat, EventSeatsResponse } from '@/types'
-import { eventsApi, bookingsApi, volunteerApi } from '@/lib/api'
+import { eventsApi, bookingsApi, paymentsApi, volunteerApi, getEventWebSocketUrl } from '@/lib/api'
 import { SeatMap } from '@/components/events/SeatMap'
 import { formatDateRange, formatCurrency, cn } from '@/lib/utils'
 import { useAuth } from '@/hooks/useAuth'
@@ -38,6 +39,11 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { toast } from 'sonner'
+
+function parseUtcMs(iso: string): number {
+  const normalized = /[zZ]$|[+-]\d{2}:\d{2}$/.test(iso) ? iso : `${iso}Z`
+  return Date.parse(normalized)
+}
 
 export function EventDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -58,6 +64,8 @@ export function EventDetailPage() {
   const [serverOffsetMs, setServerOffsetMs] = useState<number>(0)
   const [remainingSeconds, setRemainingSeconds] = useState<number | null>(null)
   const [isBooking, setIsBooking] = useState(false)
+  const [isPaying, setIsPaying] = useState(false)
+  const [paymentMethod, setPaymentMethod] = useState('bKash (Sandbox)')
   const [confirmedBooking, setConfirmedBooking] = useState<Booking | null>(null)
   const [bookingSuccessModalOpen, setBookingSuccessModalOpen] = useState(false)
 
@@ -66,6 +74,10 @@ export function EventDetailPage() {
   const [volunteerModalOpen, setVolunteerModalOpen] = useState(false)
   const [volunteerMotivation, setVolunteerMotivation] = useState('')
   const [isSubmittingVolunteer, setIsSubmittingVolunteer] = useState(false)
+
+  const isFetchingSeatsRef = useRef(false)
+  const pendingSeatRef = useRef<string | null>(null)
+  pendingSeatRef.current = pendingSeatId
 
   const isOrganizerOfThisEvent = Boolean(user && event && user.id === event.organizer_id)
   const canManageThisEvent = Boolean(isOrganizerOfThisEvent || isAdmin)
@@ -77,7 +89,7 @@ export function EventDetailPage() {
   const applySeatsSnapshot = useCallback((seatsData: EventSeatsResponse) => {
     setEventSeats(seatsData)
     if (seatsData.server_time) {
-      setServerOffsetMs(Date.parse(seatsData.server_time) - Date.now())
+      setServerOffsetMs(parseUtcMs(seatsData.server_time) - Date.now())
     }
 
     const allSeatsMap = new Map<string, Seat>()
@@ -108,13 +120,62 @@ export function EventDetailPage() {
     }
   }, [])
 
+  const patchSeatStatusesInState = useCallback(
+    (
+      updates: Array<{
+        id: string
+        status: 'AVAILABLE' | 'HELD' | 'RESERVED'
+        holder_id?: string | null
+        hold_expires_at?: string | null
+      }>
+    ) => {
+      if (!updates.length) return
+      const updateMap = new Map(updates.map((u) => [u.id, u]))
+
+      setEventSeats((prev) => {
+        if (!prev) return prev
+        return {
+          ...prev,
+          sections: prev.sections.map((sec) => ({
+            ...sec,
+            seats: sec.seats.map((s) => {
+              const u = updateMap.get(s.id)
+              if (!u) return s
+              return {
+                ...s,
+                status: u.status,
+                held_by_me: u.status === 'HELD' && Boolean(user?.id && u.holder_id === user.id),
+                hold_expires_at: u.hold_expires_at ?? null,
+              }
+            }),
+          })),
+        }
+      })
+
+      // Drop any locally selected seats if someone else booked/held them
+      setSelectedSeats((prev) =>
+        prev.filter((sel) => {
+          const u = updateMap.get(sel.id)
+          if (!u) return true
+          if (u.status === 'RESERVED') return false
+          if (u.status === 'HELD' && u.holder_id && u.holder_id !== user?.id) return false
+          return true
+        })
+      )
+    },
+    [user?.id]
+  )
+
   const refreshSeatsSilently = useCallback(async () => {
-    if (!id || !event?.is_seated) return
+    if (!id || !event?.is_seated || isFetchingSeatsRef.current) return
     try {
+      isFetchingSeatsRef.current = true
       const seatsData = await eventsApi.getSeats(id)
       applySeatsSnapshot(seatsData)
     } catch {
-      // Silently ignore background polling errors
+      // Silently ignore background sync errors
+    } finally {
+      isFetchingSeatsRef.current = false
     }
   }, [id, event?.is_seated, applySeatsSnapshot])
 
@@ -122,10 +183,23 @@ export function EventDetailPage() {
     if (!id) return
     try {
       setIsLoading(true)
-      const eventData = await eventsApi.getEvent(id)
+
+      // Launch event, seat map, and volunteer check in parallel (eliminates sequential waterfall)
+      const [eventRes, seatsRes, volunteerRes] = await Promise.allSettled([
+        eventsApi.getEvent(id),
+        eventsApi.getSeats(id),
+        isAuthenticated && user && user.role !== 'ADMIN'
+          ? volunteerApi.getMyStatus(id)
+          : Promise.resolve(null),
+      ])
+
+      if (eventRes.status !== 'fulfilled') {
+        throw eventRes.reason
+      }
+
+      const eventData = eventRes.value
       setEvent(eventData)
 
-      // Load tiers
       const eventTiers = eventData.tiers || eventData.ticket_tiers
       if (eventTiers && eventTiers.length > 0) {
         setTiers(eventTiers)
@@ -138,13 +212,9 @@ export function EventDetailPage() {
         }
       }
 
-      // Only load seat layout if the organizer explicitly enabled interactive seats
       if (eventData.is_seated) {
-        try {
-          const seatsData = await eventsApi.getSeats(id)
-          applySeatsSnapshot(seatsData)
-        } catch (seatErr) {
-          console.error('Failed to load event seats:', seatErr)
+        if (seatsRes.status === 'fulfilled' && seatsRes.value) {
+          applySeatsSnapshot(seatsRes.value)
         }
       } else {
         setEventSeats(null)
@@ -152,14 +222,12 @@ export function EventDetailPage() {
         setHoldExpiresAt(null)
       }
 
-      // Check volunteer status if authenticated non-admin and non-organizer
-      if (isAuthenticated && user && user.role !== 'ADMIN' && user.id !== eventData.organizer_id) {
-        try {
-          const statusData = await volunteerApi.getMyStatus(id)
-          setVolunteerApp(statusData)
-        } catch {
-          setVolunteerApp(null)
-        }
+      if (
+        volunteerRes.status === 'fulfilled' &&
+        volunteerRes.value &&
+        user?.id !== eventData.organizer_id
+      ) {
+        setVolunteerApp(volunteerRes.value)
       } else {
         setVolunteerApp(null)
       }
@@ -174,14 +242,83 @@ export function EventDetailPage() {
     fetchDetails()
   }, [id, isAuthenticated])
 
-  // Real-time 5-second seat sync when interactive seats are active on a published event
+  // Real-time WebSocket push (<50ms) with auto-reconnect + 20s visible-tab fallback sync
   useEffect(() => {
-    if (!event?.is_seated || event.status !== 'PUBLISHED') return
-    const timer = window.setInterval(() => {
-      refreshSeatsSilently()
-    }, 5000)
-    return () => window.clearInterval(timer)
-  }, [event?.is_seated, event?.status, refreshSeatsSilently])
+    if (!id || !event?.is_seated || event.status !== 'PUBLISHED') return
+
+    let ws: WebSocket | null = null
+    let pingInterval: number | null = null
+    let reconnectTimer: number | null = null
+    let closedByCleanup = false
+
+    const connectWebSocket = () => {
+      if (closedByCleanup) return
+      try {
+        ws = new WebSocket(getEventWebSocketUrl(id))
+        ws.onopen = () => {
+          // Catch any seat holds placed right before socket finished connecting
+          refreshSeatsSilently()
+          if (pingInterval !== null) window.clearInterval(pingInterval)
+          pingInterval = window.setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send('ping')
+            }
+          }, 25000)
+        }
+        ws.onmessage = (msg) => {
+          try {
+            const data = JSON.parse(msg.data)
+            if (data?.type === 'seat_update' && Array.isArray(data.seats)) {
+              patchSeatStatusesInState(data.seats)
+            }
+          } catch {
+            // Ignore malformed WS payloads
+          }
+        }
+        ws.onerror = () => {
+          if (!closedByCleanup) {
+            ws?.close()
+          }
+        }
+        ws.onclose = () => {
+          if (pingInterval !== null) {
+            window.clearInterval(pingInterval)
+            pingInterval = null
+          }
+          if (!closedByCleanup && reconnectTimer === null) {
+            reconnectTimer = window.setTimeout(() => {
+              reconnectTimer = null
+              connectWebSocket()
+            }, 3000)
+          }
+        }
+      } catch {
+        // Fallback interval handles updates if WebSocket is unavailable
+      }
+    }
+
+    connectWebSocket()
+
+    const fallbackTimer = window.setInterval(() => {
+      if (
+        document.visibilityState === 'visible' &&
+        !pendingSeatRef.current &&
+        !isFetchingSeatsRef.current
+      ) {
+        refreshSeatsSilently()
+      }
+    }, 20000)
+
+    return () => {
+      closedByCleanup = true
+      window.clearInterval(fallbackTimer)
+      if (pingInterval !== null) window.clearInterval(pingInterval)
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer)
+      if (ws) {
+        ws.close()
+      }
+    }
+  }, [id, event?.is_seated, event?.status, patchSeatStatusesInState, refreshSeatsSilently])
 
   // Accurate server-synchronized 10-minute hold countdown timer
   useEffect(() => {
@@ -192,7 +329,7 @@ export function EventDetailPage() {
 
     const computeRemaining = () => {
       const serverNow = Date.now() + serverOffsetMs
-      return Math.max(0, Math.floor((Date.parse(holdExpiresAt) - serverNow) / 1000))
+      return Math.max(0, Math.floor((parseUtcMs(holdExpiresAt) - serverNow) / 1000))
     }
 
     const initial = computeRemaining()
@@ -278,12 +415,13 @@ export function EventDetailPage() {
       if (isAlreadySelected) {
         const res = await eventsApi.releaseSeatHold(id, seat.id)
         if (res.server_time) {
-          setServerOffsetMs(Date.parse(res.server_time) - Date.now())
+          setServerOffsetMs(parseUtcMs(res.server_time) - Date.now())
         }
         setSelectedSeats((prev) => prev.filter((s) => s.id !== seat.id))
-        // If no held seats remain, reset timer cleanly (expires_at = null)
         setHoldExpiresAt(res.active_hold_count > 0 ? res.expires_at || null : null)
-        await refreshSeatsSilently()
+        patchSeatStatusesInState([
+          { id: seat.id, status: 'AVAILABLE', holder_id: null, hold_expires_at: null },
+        ])
       } else {
         if (selectedSeats.length >= 4) {
           toast.warning('You can hold a maximum of 4 seats per booking.')
@@ -291,13 +429,22 @@ export function EventDetailPage() {
         }
         const res = await eventsApi.holdSeat(id, seat.id)
         if (res.server_time) {
-          setServerOffsetMs(Date.parse(res.server_time) - Date.now())
+          setServerOffsetMs(parseUtcMs(res.server_time) - Date.now())
         }
         if (res.expires_at) {
           setHoldExpiresAt(res.expires_at)
         }
-        setSelectedSeats((prev) => (prev.some((s) => s.id === seat.id) ? prev : [...prev, { ...seat, status: 'HELD', held_by_me: true }]))
-        await refreshSeatsSilently()
+        setSelectedSeats((prev) =>
+          prev.some((s) => s.id === seat.id) ? prev : [...prev, { ...seat, status: 'HELD', held_by_me: true }]
+        )
+        patchSeatStatusesInState([
+          {
+            id: seat.id,
+            status: 'HELD',
+            holder_id: user?.id || null,
+            hold_expires_at: res.expires_at || null,
+          },
+        ])
       }
     } catch (err: unknown) {
       const errorMsg =
@@ -316,11 +463,14 @@ export function EventDetailPage() {
       setSelectedSeats([])
       return
     }
+    const prevIds = selectedSeats.map((s) => s.id)
     try {
       await eventsApi.releaseAllSeatHolds(id)
       setSelectedSeats([])
       setHoldExpiresAt(null)
-      await refreshSeatsSilently()
+      patchSeatStatusesInState(
+        prevIds.map((sid) => ({ id: sid, status: 'AVAILABLE', holder_id: null, hold_expires_at: null }))
+      )
     } catch {
       setSelectedSeats([])
       setHoldExpiresAt(null)
@@ -398,6 +548,12 @@ export function EventDetailPage() {
 
     try {
       setIsBooking(true)
+      const bookedSeatIds = isSeated ? selectedSeats.map((s) => s.id) : []
+      const qtyByTier = items.reduce<Record<string, number>>((acc, it) => {
+        acc[it.tier_id] = (acc[it.tier_id] || 0) + it.quantity
+        return acc
+      }, {})
+
       const booking = await bookingsApi.create({
         event_id: id!,
         items,
@@ -408,12 +564,23 @@ export function EventDetailPage() {
       setSelectedQuantities({})
       setSelectedSeats([])
       setHoldExpiresAt(null)
+      setTiers((prev) =>
+        prev.map((t) =>
+          qtyByTier[t.id]
+            ? { ...t, available_quantity: Math.max(0, t.available_quantity - qtyByTier[t.id]) }
+            : t
+        )
+      )
+      if (bookedSeatIds.length > 0) {
+        patchSeatStatusesInState(
+          bookedSeatIds.map((sid) => ({ id: sid, status: 'RESERVED', holder_id: null, hold_expires_at: null }))
+        )
+      }
       toast.success(
         booking.status === 'CONFIRMED'
           ? 'Booking confirmed! Digital tickets issued.'
           : 'Seats reserved! Check your booking in My Bookings.'
       )
-      fetchDetails()
     } catch (err: unknown) {
       const errorMsg =
         (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
@@ -612,26 +779,36 @@ export function EventDetailPage() {
                   </CardTitle>
                   <CardDescription className="text-xs">
                     {seatHoldEnabled
-                      ? 'Clicking a seat places a 10-minute temporary hold until you confirm your booking'
-                      : 'Choose your exact seats from the venue layout below'}
+                      ? 'Clicking an open green seat holds it (pink) for everyone for 10 minutes until booking completes'
+                      : 'Choose open green seats from the venue layout below (10-min hold timer is off for this event)'}
                   </CardDescription>
                 </div>
                 {canManageThisEvent && (
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={handleGenerateSeats}
-                    disabled={isGeneratingSeats}
-                    className="gap-1.5 text-xs h-8 shrink-0"
-                  >
-                    {isGeneratingSeats ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <RefreshCw className="h-3.5 w-3.5" />
+                  <div className="flex items-center gap-2 shrink-0">
+                    {!seatHoldEnabled && (
+                      <Button type="button" variant="secondary" size="sm" asChild className="h-8 text-xs">
+                        <Link to={`/organizer/events/${event.id}/edit`}>
+                          <Clock className="h-3.5 w-3.5 mr-1 text-pink-600" />
+                          Enable 10m Hold Timer
+                        </Link>
+                      </Button>
                     )}
-                    Sync Venue Seats
-                  </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={handleGenerateSeats}
+                      disabled={isGeneratingSeats}
+                      className="gap-1.5 text-xs h-8 shrink-0"
+                    >
+                      {isGeneratingSeats ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="h-3.5 w-3.5" />
+                      )}
+                      Sync Venue Seats
+                    </Button>
+                  </div>
                 )}
               </CardHeader>
               <CardContent>
@@ -764,10 +941,10 @@ export function EventDetailPage() {
                       className={cn(
                         'flex items-center justify-between rounded-lg border px-3 py-2 text-xs font-medium transition-colors',
                         remainingSeconds <= 60
-                          ? 'bg-rose-500/10 border-rose-500/30 text-rose-700 dark:text-rose-300'
+                          ? 'bg-red-500/10 border-red-500/40 text-red-700 dark:text-red-300'
                           : remainingSeconds <= 180
                           ? 'bg-amber-500/10 border-amber-500/30 text-amber-800 dark:text-amber-300'
-                          : 'bg-blue-500/10 border-blue-500/30 text-blue-800 dark:text-blue-300'
+                          : 'bg-pink-500/10 border-pink-500/30 text-pink-700 dark:text-pink-300'
                       )}
                     >
                       <span className="flex items-center gap-1.5">
@@ -784,7 +961,7 @@ export function EventDetailPage() {
                   {selectedSeats.length > 0 ? (
                     <div className="space-y-2.5">
                       <div className="flex items-center justify-between text-xs font-medium">
-                        <span className="text-foreground">Your Selected Seats ({selectedSeats.length}):</span>
+                        <span className="text-foreground">Your Chosen Seats ({selectedSeats.length}):</span>
                         <Button
                           type="button"
                           variant="ghost"
@@ -803,7 +980,7 @@ export function EventDetailPage() {
                           return (
                             <div
                               key={seat.id}
-                              className="flex items-center justify-between text-xs p-2 rounded-lg bg-blue-500/5 border border-blue-500/20"
+                              className="flex items-center justify-between text-xs p-2 rounded-lg bg-pink-500/5 border border-pink-500/25"
                             >
                               <div>
                                 <span className="font-semibold text-foreground">
@@ -1069,24 +1246,37 @@ export function EventDetailPage() {
         </DialogContent>
       </Dialog>
 
-      {/* Booking Confirmation Dialog */}
+      {/* Booking / Payment Checkout Dialog */}
       <Dialog open={bookingSuccessModalOpen} onOpenChange={setBookingSuccessModalOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-600 mb-2">
-              <CheckCircle2 className="h-8 w-8" />
+            <div
+              className={cn(
+                'mx-auto flex h-12 w-12 items-center justify-center rounded-full mb-2',
+                confirmedBooking?.status === 'CONFIRMED'
+                  ? 'bg-emerald-500/10 text-emerald-600'
+                  : 'bg-pink-500/10 text-pink-600'
+              )}
+            >
+              {confirmedBooking?.status === 'CONFIRMED' ? (
+                <CheckCircle2 className="h-8 w-8" />
+              ) : (
+                <CreditCard className="h-7 w-7" />
+              )}
             </div>
             <DialogTitle className="text-center text-xl">
-              {confirmedBooking?.status === 'CONFIRMED' ? 'Booking Confirmed!' : 'Seats Reserved — Pending Payment'}
+              {confirmedBooking?.status === 'CONFIRMED'
+                ? 'Booking Confirmed!'
+                : 'Complete Payment to Issue Tickets'}
             </DialogTitle>
             <DialogDescription className="text-center">
               {confirmedBooking?.status === 'CONFIRMED' ? (
                 <>
-                  Your tickets for <strong className="text-foreground">{event.title}</strong> have been confirmed and issued with cryptographic QR passes.
+                  Your tickets for <strong className="text-foreground">{event.title}</strong> are confirmed and now live in <strong>My Tickets</strong> with QR codes.
                 </>
               ) : (
                 <>
-                  Your booking for <strong className="text-foreground">{event.title}</strong> is saved under My Bookings awaiting payment confirmation.
+                  Your reservation for <strong className="text-foreground">{event.title}</strong> is ready. Complete checkout below to confirm your booking and generate QR passes.
                 </>
               )}
             </DialogDescription>
@@ -1105,6 +1295,17 @@ export function EventDetailPage() {
                 </span>
               </div>
               <div className="flex justify-between">
+                <span className="text-muted-foreground">Status:</span>
+                <span
+                  className={cn(
+                    'font-semibold',
+                    confirmedBooking.status === 'CONFIRMED' ? 'text-emerald-600' : 'text-amber-600'
+                  )}
+                >
+                  {confirmedBooking.status}
+                </span>
+              </div>
+              <div className="flex justify-between">
                 <span className="text-muted-foreground">Total Amount:</span>
                 <span className="font-semibold text-primary">
                   {Number(confirmedBooking.total_amount) === 0
@@ -1115,17 +1316,93 @@ export function EventDetailPage() {
             </div>
           )}
 
+          {confirmedBooking?.status === 'PENDING' && (
+            <div className="space-y-3 pt-1">
+              <div className="space-y-1.5">
+                <Label className="text-xs font-medium">Select Payment Method (Sandbox)</Label>
+                <div className="grid grid-cols-3 gap-2">
+                  {['bKash (Sandbox)', 'Nagad (Sandbox)', 'Card (Visa/MC)'].map((m) => (
+                    <button
+                      key={m}
+                      type="button"
+                      onClick={() => setPaymentMethod(m)}
+                      className={cn(
+                        'px-2.5 py-2 rounded-lg border text-xs font-medium transition-colors',
+                        paymentMethod === m
+                          ? 'border-primary bg-primary/10 text-primary'
+                          : 'border-border hover:bg-muted/50 text-muted-foreground'
+                      )}
+                    >
+                      {m.split(' ')[0]}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <Button
+                className="w-full gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white"
+                disabled={isPaying}
+                onClick={async () => {
+                  if (!confirmedBooking) return
+                  try {
+                    setIsPaying(true)
+                    const initRes = await paymentsApi.initiate(confirmedBooking.id, paymentMethod)
+                    if (initRes.mode === 'sslcommerz' && initRes.gateway_url) {
+                      window.location.href = initRes.gateway_url
+                      return
+                    }
+                    const paidBooking = await paymentsApi.confirm(confirmedBooking.id, paymentMethod)
+                    setConfirmedBooking(paidBooking)
+                    toast.success('Payment verified! Digital tickets are now in My Tickets.')
+                  } catch (err: unknown) {
+                    const msg =
+                      (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+                      'Payment confirmation failed. Please try from My Bookings.'
+                    toast.error(msg)
+                  } finally {
+                    setIsPaying(false)
+                  }
+                }}
+              >
+                {isPaying ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Processing Payment...
+                  </>
+                ) : (
+                  <>
+                    <CreditCard className="h-4 w-4" />
+                    Pay {formatCurrency(confirmedBooking.total_amount)} &amp; Issue Tickets
+                  </>
+                )}
+              </Button>
+            </div>
+          )}
+
           <div className="space-y-2 pt-2">
-            <Button
-              className="w-full gap-1.5"
-              onClick={() => {
-                setBookingSuccessModalOpen(false)
-                navigate('/my-bookings')
-              }}
-            >
-              <Ticket className="h-4 w-4" />
-              View My Bookings & Passes
-            </Button>
+            {confirmedBooking?.status === 'CONFIRMED' ? (
+              <Button
+                className="w-full gap-1.5"
+                onClick={() => {
+                  setBookingSuccessModalOpen(false)
+                  navigate('/tickets')
+                }}
+              >
+                <Ticket className="h-4 w-4" />
+                View My Tickets &amp; QR Passes
+              </Button>
+            ) : (
+              <Button
+                variant="secondary"
+                className="w-full gap-1.5"
+                onClick={() => {
+                  setBookingSuccessModalOpen(false)
+                  navigate('/my-bookings')
+                }}
+              >
+                Pay Later in My Bookings
+              </Button>
+            )}
             <Button
               variant="outline"
               className="w-full"

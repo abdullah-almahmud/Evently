@@ -99,6 +99,25 @@ async def get_current_admin(
     return user
 
 
+async def get_optional_user_id(
+    token: Optional[str] = Depends(optional_oauth2_scheme),
+) -> Optional[uuid.UUID]:
+    """
+    Extracts the user UUID directly from a valid bearer JWT without hitting the DB.
+    Used for public read endpoints like seat maps where only held_by_me checks need user identity.
+    """
+    if not token:
+        return None
+    try:
+        payload = decode_token(token)
+        user_id_str = payload.get("sub")
+        if not user_id_str:
+            return None
+        return uuid.UUID(user_id_str)
+    except Exception:
+        return None
+
+
 async def get_optional_current_user(
     token: Optional[str] = Depends(optional_oauth2_scheme),
     db: AsyncSession = Depends(get_db),

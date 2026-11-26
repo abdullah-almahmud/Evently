@@ -8,14 +8,16 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import joinedload, selectinload
 from app.api.v1.venues import format_venue_response
+from app.api.v1.websocket_routes import broadcast_event_seat_update
 from app.core.database import get_db
 from app.core.deps import (
     get_current_active_user,
     get_current_organizer,
     get_current_user,
     get_optional_current_user,
+    get_optional_user_id,
     oauth2_scheme,
 )
 from app.core.redis import hold_seat, release_seat
@@ -78,10 +80,10 @@ MAX_HELD_SEATS_PER_USER = 4
 
 
 def _event_load_options():
-    """Consistent eager-loading options for Event responses."""
+    """Consistent eager-loading options for Event responses using joinedload for to-one paths."""
     return (
-        selectinload(Event.organizer),
-        selectinload(Event.venue).selectinload(Venue.sections),
+        joinedload(Event.organizer),
+        joinedload(Event.venue).selectinload(Venue.sections),
         selectinload(Event.tiers),
     )
 
@@ -1028,43 +1030,58 @@ async def _expire_stale_holds(event_id: UUID, db: AsyncSession, now: datetime) -
 
 
 async def _build_event_seats_response(
-    event: Event,
+    event_id: UUID,
+    venue_id: Optional[UUID],
+    seat_hold_enabled: bool,
     all_seats: List[Seat],
-    current_user: Optional[User],
+    current_user_id: Optional[UUID],
     db: AsyncSession,
     now: datetime,
 ) -> EventSeatsResponse:
-    """Constructs the live EventSeatsResponse with AVAILABLE / HELD / RESERVED states."""
+    """
+    Constructs the live EventSeatsResponse with AVAILABLE / HELD / RESERVED states.
+    Only performs a write COMMIT if stale ACTIVE holds actually need expiring.
+    """
     reserved_res = await db.execute(
         select(BookingItem.seat_id)
         .join(Booking, Booking.id == BookingItem.booking_id)
         .where(
             BookingItem.seat_id.is_not(None),
-            Booking.event_id == event.id,
+            Booking.event_id == event_id,
             Booking.status.in_([BookingStatus.CONFIRMED, BookingStatus.PENDING]),
         )
     )
     reserved_seat_ids = {row[0] for row in reserved_res.fetchall()}
 
-    # Fetch active non-expired holds if hold mode is active (or clean up any lingering active holds)
-    active_holds: Dict[UUID, tuple] = {}
-    my_hold_expires_at: Optional[datetime] = None
-
-    event_seat_ids_subq = select(Seat.id).where(Seat.event_id == event.id)
+    # Fetch ACTIVE holds for this event; expire stale ones only when encountered
+    event_seat_ids_subq = select(Seat.id).where(Seat.event_id == event_id)
     holds_res = await db.execute(
-        select(SeatHold)
-        .where(
+        select(SeatHold).where(
             SeatHold.seat_id.in_(event_seat_ids_subq),
             SeatHold.status == SeatHoldStatus.ACTIVE,
-            SeatHold.expires_at > now,
         )
     )
+    active_holds: Dict[UUID, tuple] = {}
+    expired_hold_ids: List[UUID] = []
+    my_hold_expires_at: Optional[datetime] = None
+
     for hold in holds_res.scalars().all():
+        if hold.expires_at <= now:
+            expired_hold_ids.append(hold.id)
+            continue
         if hold.seat_id:
             active_holds[hold.seat_id] = (hold.user_id, hold.expires_at)
-            if current_user and hold.user_id == current_user.id:
+            if current_user_id and hold.user_id == current_user_id:
                 if my_hold_expires_at is None or hold.expires_at < my_hold_expires_at:
                     my_hold_expires_at = hold.expires_at
+
+    if expired_hold_ids:
+        await db.execute(
+            update(SeatHold)
+            .where(SeatHold.id.in_(expired_hold_ids))
+            .values(status=SeatHoldStatus.EXPIRED)
+        )
+        await db.commit()
 
     # Group seats by section
     section_map: Dict[str, List[Seat]] = {}
@@ -1073,7 +1090,7 @@ async def _build_event_seats_response(
         section_map.setdefault(sid, []).append(seat)
 
     sections_res = await db.execute(
-        select(VenueSection).where(VenueSection.venue_id == event.venue_id)
+        select(VenueSection).where(VenueSection.venue_id == venue_id)
     )
     ordered_sections = sort_sections_front_to_back(list(sections_res.scalars().all()))
 
@@ -1098,7 +1115,7 @@ async def _build_event_seats_response(
                 seat_status = "RESERVED"
             elif s.id in active_holds:
                 holder_id, hold_exp = active_holds[s.id]
-                held_by_me = bool(current_user and holder_id == current_user.id)
+                held_by_me = bool(current_user_id and holder_id == current_user_id)
                 seat_status = "HELD"
             else:
                 seat_status = "AVAILABLE"
@@ -1128,9 +1145,9 @@ async def _build_event_seats_response(
         )
 
     return EventSeatsResponse(
-        event_id=event.id,
+        event_id=event_id,
         is_seated=True,
-        seat_hold_enabled=bool(event.seat_hold_enabled),
+        seat_hold_enabled=bool(seat_hold_enabled),
         my_hold_expires_at=my_hold_expires_at,
         server_time=now,
         sections=section_groups,
@@ -1170,33 +1187,36 @@ async def generate_seats_for_event(
     await db.commit()
 
     now = datetime.now(timezone.utc)
-    return await _build_event_seats_response(event, all_seats, current_user, db, now)
+    return await _build_event_seats_response(
+        event.id, event.venue_id, bool(event.seat_hold_enabled), all_seats, current_user.id, db, now
+    )
 
 
 @router.get("/{event_id}/seats", response_model=EventSeatsResponse)
 async def get_event_seats(
     event_id: UUID,
-    current_user: Optional[User] = Depends(get_optional_current_user),
+    current_user_id: Optional[UUID] = Depends(get_optional_user_id),
     db: AsyncSession = Depends(get_db),
 ) -> EventSeatsResponse:
     """
-    Public (with optional auth): returns the full venue seat map and live seat statuses
-    (AVAILABLE, HELD with held_by_me flag, RESERVED). Auto-expires timed holds and
-    syncs seats for seated events that do not yet have seats populated.
+    Public (with optional JWT decode): returns the full venue seat map and live seat statuses
+    (AVAILABLE, HELD with held_by_me flag, RESERVED). Optimized to avoid unnecessary eager loads or commits.
     """
     now = datetime.now(timezone.utc)
-    query = (
-        select(Event)
-        .where(Event.id == event_id)
-        .options(*_event_load_options())
-    )
-    res = await db.execute(query)
-    event = res.scalar_one_or_none()
+    resolved_user_id = current_user_id
 
-    if not event:
+    ev_row = (
+        await db.execute(
+            select(Event.id, Event.is_seated, Event.seat_hold_enabled, Event.venue_id)
+            .where(Event.id == event_id)
+        )
+    ).first()
+
+    if not ev_row:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
 
-    if not event.is_seated:
+    _, is_seated_flag, seat_hold_flag, venue_id = ev_row
+    if not is_seated_flag:
         return EventSeatsResponse(
             event_id=event_id,
             is_seated=False,
@@ -1206,12 +1226,18 @@ async def get_event_seats(
             sections=[],
         )
 
-    await _expire_stale_holds(event_id, db, now)
+    existing_res = await db.execute(
+        select(Seat).where(Seat.event_id == event_id).order_by(Seat.row_label, Seat.seat_number)
+    )
+    all_seats = list(existing_res.scalars().all())
+    if not all_seats:
+        full_ev = (await db.execute(select(Event).where(Event.id == event_id))).scalar_one()
+        all_seats = await _ensure_event_seats(full_ev, db, force_regenerate=False)
+        await db.commit()
 
-    all_seats = await _ensure_event_seats(event, db, force_regenerate=False)
-    await db.commit()
-
-    return await _build_event_seats_response(event, all_seats, current_user, db, now)
+    return await _build_event_seats_response(
+        event_id, venue_id, bool(seat_hold_flag), all_seats, resolved_user_id, db, now
+    )
 
 
 @router.delete("/{event_id}/seats/holds", response_model=SeatHoldActionResponse)
@@ -1222,7 +1248,7 @@ async def release_all_event_holds(
 ) -> SeatHoldActionResponse:
     """
     Releases ALL active seat holds held by the authenticated user for this event,
-    resetting their checkout timer cleanly.
+    resetting their checkout timer cleanly and broadcasting live updates.
     """
     now = datetime.now(timezone.utc)
     event_seat_ids_subq = select(Seat.id).where(Seat.event_id == event_id)
@@ -1235,15 +1261,27 @@ async def release_all_event_holds(
         )
     )
     holds = active_res.scalars().all()
+    released_seat_ids: List[UUID] = []
     for h in holds:
         h.status = SeatHoldStatus.EXPIRED
         if h.seat_id:
-            try:
-                await release_seat(str(h.seat_id))
-            except Exception:
-                pass
+            released_seat_ids.append(h.seat_id)
+            await release_seat(str(h.seat_id))
 
-    await db.commit()
+    if holds:
+        await db.commit()
+
+    if released_seat_ids:
+        await broadcast_event_seat_update(
+            event_id,
+            [
+                {"id": str(sid), "status": "AVAILABLE", "holder_id": None, "hold_expires_at": None}
+                for sid in released_seat_ids
+            ],
+            reason="release_all",
+            actor_id=current_user.id,
+        )
+
     return SeatHoldActionResponse(
         seat_id=None,
         held=False,
@@ -1272,26 +1310,36 @@ async def hold_event_seat(
         )
 
     now = datetime.now(timezone.utc)
-    event = (await db.execute(select(Event).where(Event.id == event_id))).scalar_one_or_none()
-    if not event:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
-    if event.organizer_id == current_user.id:
+    joined_row = (
+        await db.execute(
+            select(
+                Seat,
+                Event.is_seated,
+                Event.seat_hold_enabled,
+                Event.status,
+                Event.organizer_id,
+            )
+            .join(Event, Event.id == Seat.event_id)
+            .where(Seat.id == seat_id, Seat.event_id == event_id)
+        )
+    ).first()
+
+    if not joined_row:
+        ev_exists = (await db.execute(select(Event.id).where(Event.id == event_id))).scalar_one_or_none()
+        if not ev_exists:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Seat not found for this event")
+
+    seat, is_seated_flag, seat_hold_flag, event_status, organizer_id = joined_row
+    if organizer_id == current_user.id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Organizers cannot hold seats for their own event")
-    if not event.is_seated or not event.seat_hold_enabled:
+    if not is_seated_flag or not seat_hold_flag:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Timed seat holds are not enabled for this event",
         )
-    if event.status != EventStatus.PUBLISHED:
+    if event_status != EventStatus.PUBLISHED:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Event is not open for booking")
-
-    await _expire_stale_holds(event_id, db, now)
-
-    seat = (
-        await db.execute(select(Seat).where(Seat.id == seat_id, Seat.event_id == event_id))
-    ).scalar_one_or_none()
-    if not seat:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Seat not found for this event")
 
     # Verify seat isn't permanently booked
     booked_cnt = (
@@ -1311,27 +1359,15 @@ async def hold_event_seat(
             detail=f"Seat {seat.row_label}{seat.seat_number} is already booked.",
         )
 
-    # Check active holds on this seat
-    existing_seat_hold = (
-        await db.execute(
-            select(SeatHold).where(
-                SeatHold.seat_id == seat_id,
-                SeatHold.status == SeatHoldStatus.ACTIVE,
-                SeatHold.expires_at > now,
-            )
-        )
-    ).scalar_one_or_none()
-
+    # Single query for all ACTIVE holds in this event (checks target seat, user's holds & stale expiry together)
     event_seat_ids_subq = select(Seat.id).where(Seat.event_id == event_id)
-    my_active_holds = list(
+    all_active_rows = list(
         (
             await db.execute(
                 select(SeatHold)
                 .where(
                     SeatHold.seat_id.in_(event_seat_ids_subq),
-                    SeatHold.user_id == current_user.id,
                     SeatHold.status == SeatHoldStatus.ACTIVE,
-                    SeatHold.expires_at > now,
                 )
                 .order_by(SeatHold.expires_at.asc())
             )
@@ -1340,13 +1376,34 @@ async def hold_event_seat(
         .all()
     )
 
+    expired_ids: List[UUID] = []
+    existing_seat_hold: Optional[SeatHold] = None
+    my_active_holds: List[SeatHold] = []
+
+    for h in all_active_rows:
+        if h.expires_at <= now:
+            expired_ids.append(h.id)
+            continue
+        if h.seat_id == seat_id:
+            existing_seat_hold = h
+        if h.user_id == current_user.id:
+            my_active_holds.append(h)
+
+    if expired_ids:
+        await db.execute(
+            update(SeatHold)
+            .where(SeatHold.id.in_(expired_ids))
+            .values(status=SeatHoldStatus.EXPIRED)
+        )
+
     if existing_seat_hold:
+        if expired_ids:
+            await db.commit()
         if existing_seat_hold.user_id != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Seat {seat.row_label}{seat.seat_number} is currently held by another attendee.",
             )
-        # Idempotent: already held by current user
         return SeatHoldActionResponse(
             seat_id=seat_id,
             held=True,
@@ -1362,6 +1419,8 @@ async def hold_event_seat(
 
     max_per_user = tier.max_per_user if tier else MAX_HELD_SEATS_PER_USER
     if len(my_active_holds) >= MAX_HELD_SEATS_PER_USER:
+        if expired_ids:
+            await db.commit()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"You can hold up to {MAX_HELD_SEATS_PER_USER} seats at a time.",
@@ -1380,6 +1439,8 @@ async def hold_event_seat(
             )
         ).scalar_one() or 0
         if holds_in_tier + booked_in_tier >= max_per_user:
+            if expired_ids:
+                await db.commit()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Maximum {max_per_user} seats allowed per user for tier '{tier.name}'.",
@@ -1413,10 +1474,20 @@ async def hold_event_seat(
     db.add(hold)
     await db.commit()
 
-    try:
-        await hold_seat(seat_id=str(seat.id), user_id=str(current_user.id))
-    except Exception:
-        pass
+    await hold_seat(seat_id=str(seat.id), user_id=str(current_user.id))
+    await broadcast_event_seat_update(
+        event_id,
+        [
+            {
+                "id": str(seat.id),
+                "status": "HELD",
+                "holder_id": str(current_user.id),
+                "hold_expires_at": expires_at.isoformat(),
+            }
+        ],
+        reason="hold",
+        actor_id=current_user.id,
+    )
 
     return SeatHoldActionResponse(
         seat_id=seat.id,
@@ -1439,44 +1510,39 @@ async def release_event_seat(
     If no seats remain held by the user on this event, returns expires_at=None (timer resets).
     """
     now = datetime.now(timezone.utc)
-    await _expire_stale_holds(event_id, db, now)
+    event_seat_ids_subq = select(Seat.id).where(Seat.event_id == event_id)
 
-    holds_res = await db.execute(
-        select(SeatHold).where(
-            SeatHold.seat_id == seat_id,
+    # Single query for all ACTIVE holds owned by this user + any stale holds on event
+    my_holds_res = await db.execute(
+        select(SeatHold)
+        .where(
+            SeatHold.seat_id.in_(event_seat_ids_subq),
             SeatHold.user_id == current_user.id,
             SeatHold.status == SeatHoldStatus.ACTIVE,
         )
+        .order_by(SeatHold.expires_at.asc())
     )
-    for h in holds_res.scalars().all():
-        h.status = SeatHoldStatus.EXPIRED
+    remaining_holds: List[SeatHold] = []
+    released_target = False
 
-    await db.flush()
-
-    try:
-        await release_seat(str(seat_id))
-    except Exception:
-        pass
-
-    event_seat_ids_subq = select(Seat.id).where(Seat.event_id == event_id)
-    remaining_holds = list(
-        (
-            await db.execute(
-                select(SeatHold)
-                .where(
-                    SeatHold.seat_id.in_(event_seat_ids_subq),
-                    SeatHold.user_id == current_user.id,
-                    SeatHold.status == SeatHoldStatus.ACTIVE,
-                    SeatHold.expires_at > now,
-                )
-                .order_by(SeatHold.expires_at.asc())
-            )
-        )
-        .scalars()
-        .all()
-    )
+    for h in my_holds_res.scalars().all():
+        if h.seat_id == seat_id or h.expires_at <= now:
+            h.status = SeatHoldStatus.EXPIRED
+            if h.seat_id == seat_id:
+                released_target = True
+        else:
+            remaining_holds.append(h)
 
     await db.commit()
+    await release_seat(str(seat_id))
+
+    if released_target:
+        await broadcast_event_seat_update(
+            event_id,
+            [{"id": str(seat_id), "status": "AVAILABLE", "holder_id": None, "hold_expires_at": None}],
+            reason="release",
+            actor_id=current_user.id,
+        )
 
     return SeatHoldActionResponse(
         seat_id=seat_id,

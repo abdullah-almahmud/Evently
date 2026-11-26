@@ -34,6 +34,24 @@ import type {
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1'
 
+export function getEventWebSocketUrl(eventId: string): string {
+  const cleanApi = API_BASE_URL.replace(/\/+$/, '')
+  const wsBase = cleanApi.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:')
+  return `${wsBase}/ws/events/${eventId}`
+}
+
+function getJwtExpMs(token: string): number | null {
+  try {
+    const parts = token.split('.')
+    if (parts.length !== 3) return null
+    const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    const payload = JSON.parse(atob(base64))
+    return typeof payload.exp === 'number' ? payload.exp * 1000 : null
+  } catch {
+    return null
+  }
+}
+
 export const api = axios.create({
   baseURL: API_BASE_URL,
   headers: {
@@ -41,19 +59,6 @@ export const api = axios.create({
   },
 })
 
-// Request interceptor to attach JWT access token
-api.interceptors.request.use(
-  (config: InternalAxiosRequestConfig) => {
-    const token = localStorage.getItem('evently_access_token')
-    if (token && config.headers) {
-      config.headers.Authorization = `Bearer ${token}`
-    }
-    return config
-  },
-  (error) => Promise.reject(error)
-)
-
-// Response interceptor with auto refresh on 401
 let isRefreshing = false
 let failedQueue: Array<{
   resolve: (value?: unknown) => void
@@ -70,6 +75,57 @@ const processQueue = (error: AxiosError | null, token: string | null = null) => 
   })
   failedQueue = []
 }
+
+// Request interceptor: proactively refreshes near-expiry tokens before optional/auth endpoints
+api.interceptors.request.use(
+  async (config: InternalAxiosRequestConfig) => {
+    let token = localStorage.getItem('evently_access_token')
+    const url = config.url || ''
+    const isAuthEndpoint = url.includes('/auth/login') || url.includes('/auth/refresh') || url.includes('/auth/register')
+
+    if (token && !isAuthEndpoint) {
+      const expMs = getJwtExpMs(token)
+      const refreshToken = localStorage.getItem('evently_refresh_token')
+      if (expMs !== null && expMs <= Date.now() + 30_000 && refreshToken) {
+        if (isRefreshing) {
+          try {
+            const freshToken = (await new Promise<unknown>((resolve, reject) => {
+              failedQueue.push({ resolve, reject })
+            })) as string
+            token = freshToken
+          } catch {
+            // Fall through with existing token
+          }
+        } else {
+          isRefreshing = true
+          try {
+            const response = await axios.post<AuthTokens>(`${API_BASE_URL}/auth/refresh`, {
+              refresh_token: refreshToken,
+            })
+            token = response.data.access_token
+            const newRefreshToken = response.data.refresh_token || refreshToken
+            localStorage.setItem('evently_access_token', token)
+            localStorage.setItem('evently_refresh_token', newRefreshToken)
+            processQueue(null, token)
+          } catch (refreshErr) {
+            processQueue(refreshErr as AxiosError, null)
+            localStorage.removeItem('evently_access_token')
+            localStorage.removeItem('evently_refresh_token')
+            token = null
+          } finally {
+            isRefreshing = false
+          }
+        }
+      }
+    }
+
+    if (token && config.headers) {
+      config.headers.Authorization = `Bearer ${token}`
+    }
+    return config
+  },
+  (error) => Promise.reject(error)
+)
 
 api.interceptors.response.use(
   (response) => response,
@@ -400,6 +456,28 @@ export const bookingsApi = {
 
   getEventBookings: async (eventId: string): Promise<Booking[]> => {
     const res = await api.get<Booking[]>(`/bookings/event/${eventId}`)
+    return res.data
+  },
+}
+
+export interface PaymentInitiateResult {
+  mode: 'sandbox' | 'sslcommerz' | 'already_confirmed'
+  booking_id: string
+  tran_id: string
+  amount: number
+  gateway: string
+  gateway_url?: string | null
+  message: string
+}
+
+export const paymentsApi = {
+  initiate: async (bookingId: string, method = 'Card / Mobile Banking (Sandbox)'): Promise<PaymentInitiateResult> => {
+    const res = await api.post<PaymentInitiateResult>(`/payments/initiate/${bookingId}`, { method })
+    return res.data
+  },
+
+  confirm: async (bookingId: string, method = 'Card / Mobile Banking (Sandbox)'): Promise<Booking> => {
+    const res = await api.post<Booking>(`/payments/confirm/${bookingId}`, { method })
     return res.data
   },
 }

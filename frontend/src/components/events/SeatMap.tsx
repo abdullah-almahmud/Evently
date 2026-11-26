@@ -87,7 +87,7 @@ export const SeatMap: React.FC<SeatMapProps> = ({
             </span>
             {seatHoldEnabled && (
               <Badge variant="outline" className="text-[11px] font-medium gap-1 bg-background">
-                <Clock className="h-3 w-3 text-amber-600" />
+                <Clock className="h-3 w-3 text-pink-600" />
                 10-Min Hold Active on Click
               </Badge>
             )}
@@ -99,10 +99,10 @@ export const SeatMap: React.FC<SeatMapProps> = ({
               className={cn(
                 'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-mono text-xs font-semibold border transition-colors',
                 remainingSeconds <= 60
-                  ? 'bg-rose-500/10 border-rose-500/40 text-rose-600 dark:text-rose-400'
+                  ? 'bg-red-500/15 border-red-500/50 text-red-700 dark:text-red-300'
                   : remainingSeconds <= 180
-                  ? 'bg-amber-500/10 border-amber-500/40 text-amber-700 dark:text-amber-300'
-                  : 'bg-blue-500/10 border-blue-500/40 text-blue-700 dark:text-blue-300'
+                  ? 'bg-amber-500/15 border-amber-500/50 text-amber-800 dark:text-amber-300'
+                  : 'bg-pink-500/15 border-pink-500/40 text-pink-700 dark:text-pink-300'
               )}
             >
               <Clock className="h-3.5 w-3.5" />
@@ -111,25 +111,23 @@ export const SeatMap: React.FC<SeatMapProps> = ({
           )}
         </div>
 
-        {/* Color Legend — every state has a distinct color */}
+        {/* Color Legend — Green: Open, Pink: Chosen (visible to all users), Red: Taken */}
         <div className="flex flex-wrap items-center gap-x-5 gap-y-2 pt-2 border-t border-border/60">
           <div className="flex items-center gap-1.5">
             <span className="inline-block h-3.5 w-3.5 rounded-sm border-2 border-emerald-500 bg-emerald-50 dark:bg-emerald-950/40" />
-            <span className="text-muted-foreground font-medium">Available</span>
+            <span className="text-foreground font-medium">Open</span>
           </div>
           <div className="flex items-center gap-1.5">
-            <span className="inline-block h-3.5 w-3.5 rounded-sm bg-blue-600 border-2 border-blue-700" />
-            <span className="text-foreground font-semibold">Selected (Unbooked)</span>
+            <span className="inline-block h-3.5 w-3.5 rounded-sm bg-pink-500 border-2 border-pink-600" />
+            <span className="text-foreground font-semibold">Chosen (Yours ✓)</span>
           </div>
-          {seatHoldEnabled && (
-            <div className="flex items-center gap-1.5">
-              <span className="inline-block h-3.5 w-3.5 rounded-sm bg-amber-100 border-2 border-amber-400 dark:bg-amber-950/60 dark:border-amber-500" />
-              <span className="text-muted-foreground font-medium">Held by Other</span>
-            </div>
-          )}
           <div className="flex items-center gap-1.5">
-            <span className="inline-block h-3.5 w-3.5 rounded-sm bg-rose-100/80 border-2 border-rose-300 dark:bg-rose-950/40 dark:border-rose-800" />
-            <span className="text-muted-foreground font-medium">Booked</span>
+            <span className="inline-block h-3.5 w-3.5 rounded-sm bg-pink-300 border-2 border-pink-600 dark:bg-pink-600/80 dark:border-pink-400" />
+            <span className="text-foreground font-medium">Chosen (Someone Else)</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="inline-block h-3.5 w-3.5 rounded-sm bg-red-600 border-2 border-red-700" />
+            <span className="text-muted-foreground font-medium">Taken</span>
           </div>
         </div>
       </div>
@@ -227,10 +225,10 @@ export const SeatMap: React.FC<SeatMapProps> = ({
 
       {/* Selected Seats Chip Summary */}
       {selectedSeats.length > 0 && (
-        <div className="p-4 rounded-xl border bg-blue-500/5 border-blue-500/25 space-y-2">
+        <div className="p-4 rounded-xl border bg-pink-500/5 border-pink-500/25 space-y-2">
           <div className="flex items-center justify-between text-xs font-semibold">
             <span className="text-foreground">
-              Selected Seats — Not Booked Yet ({selectedSeats.length} of max {maxSelectable}):
+              Chosen Seats — Not Booked Yet ({selectedSeats.length} of max {maxSelectable}):
             </span>
             <span className="text-muted-foreground text-[11px]">Click a seat to unselect</span>
           </div>
@@ -245,7 +243,7 @@ export const SeatMap: React.FC<SeatMapProps> = ({
                   type="button"
                   onClick={() => onSeatToggle(seat, t)}
                   disabled={disabled || pendingSeatId === seat.id}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-blue-600 text-white text-xs font-medium hover:bg-blue-700 transition-colors shadow-sm"
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-pink-600 text-white text-xs font-medium hover:bg-pink-700 transition-colors shadow-sm"
                 >
                   <span>
                     {sec?.section_name || 'Section'} • {seat.row_label}{seat.seat_number}
@@ -313,32 +311,32 @@ export const SeatMap: React.FC<SeatMapProps> = ({
                           onClick={() => onSeatToggle(seat, seatTier)}
                           title={`${sec.section_name} • Row ${seat.row_label}, Seat ${seat.seat_number} (${
                             isReserved
-                              ? 'Booked'
+                              ? 'Taken / Booked'
                               : isHeldByOther
-                              ? 'Temporarily held by another attendee'
+                              ? 'Chosen by another attendee'
                               : isSelected
-                              ? 'Selected (Not booked yet)'
+                              ? 'Chosen by you (click to unselect)'
                               : seatTier
-                              ? `${seatTier.name} — ${
+                              ? `Open — ${seatTier.name} (${
                                   Number(seatTier.price) === 0 ? 'Free' : formatCurrency(seatTier.price)
-                                }`
-                              : 'Available'
+                                })`
+                              : 'Open'
                           })`}
                           className={cn(
                             'relative flex h-8 w-8 items-center justify-center rounded-md font-mono text-[11px] font-semibold transition-all select-none',
-                            // Permanently Booked
+                            // Red: Taken / Booked
                             isReserved &&
-                              'bg-rose-100/70 text-rose-400 border border-rose-300/80 dark:bg-rose-950/30 dark:border-rose-900/50 dark:text-rose-400/70 cursor-not-allowed',
-                            // Held by another user (10-min timer)
+                              'bg-red-600 text-white border-2 border-red-700 opacity-90 dark:bg-red-700 dark:border-red-500 cursor-not-allowed',
+                            // Pink (Medium Pink): Chosen by another user (visible to everyone)
                             isHeldByOther &&
-                              'bg-amber-100 text-amber-800 border-2 border-amber-400 dark:bg-amber-950/50 dark:border-amber-600/80 dark:text-amber-300 cursor-not-allowed',
-                            // Selected by current user (unbooked)
+                              'bg-pink-300 text-pink-950 border-2 border-pink-600 dark:bg-pink-600/80 dark:border-pink-400 dark:text-white cursor-not-allowed',
+                            // Pink (Vibrant): Chosen by current user (unbooked)
                             isSelected &&
-                              'bg-blue-600 text-white border-2 border-blue-700 shadow-sm ring-2 ring-blue-400/40 scale-105',
-                            // Available
+                              'bg-pink-500 text-white border-2 border-pink-600 shadow-sm ring-2 ring-pink-300/60 scale-105 hover:bg-pink-600',
+                            // Green: Open / Available
                             !isLocked &&
                               !isSelected &&
-                              'bg-emerald-50/70 dark:bg-emerald-950/25 border-2 border-emerald-500 text-emerald-900 dark:text-emerald-200 hover:bg-emerald-500/20 hover:border-emerald-600 active:scale-95'
+                              'bg-emerald-50/80 dark:bg-emerald-950/30 border-2 border-emerald-500 text-emerald-900 dark:text-emerald-200 hover:bg-emerald-500/20 hover:border-emerald-600 active:scale-95'
                           )}
                         >
                           {isPending ? (

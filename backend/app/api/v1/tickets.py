@@ -2,7 +2,7 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import joinedload
 
 from app.core.database import get_db
 from app.core.deps import get_current_active_user
@@ -31,9 +31,9 @@ async def get_my_tickets(
         select(Ticket)
         .where(Ticket.user_id == current_user.id)
         .options(
-            selectinload(Ticket.event).selectinload(Event.venue),
-            selectinload(Ticket.tier),
-            selectinload(Ticket.seat),
+            joinedload(Ticket.event).joinedload(Event.venue),
+            joinedload(Ticket.tier),
+            joinedload(Ticket.seat),
         )
         .order_by(Ticket.created_at.desc())
     )

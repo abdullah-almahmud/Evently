@@ -1,10 +1,23 @@
 import json
+import time
 from typing import Any, Dict, Optional
 import redis.asyncio as aioredis
 from redis.asyncio import Redis
 from app.core.config import settings
 
 redis_client: Optional[Redis] = None
+_redis_unavailable_until: float = 0.0
+_REDIS_RETRY_COOLDOWN_SECONDS = 60.0
+
+
+def mark_redis_unavailable() -> None:
+    """Trips a short circuit breaker so offline local Redis never stalls HTTP requests."""
+    global _redis_unavailable_until
+    _redis_unavailable_until = time.monotonic() + _REDIS_RETRY_COOLDOWN_SECONDS
+
+
+def is_redis_available() -> bool:
+    return time.monotonic() >= _redis_unavailable_until
 
 
 def get_redis() -> Redis:
@@ -17,8 +30,8 @@ def get_redis() -> Redis:
             settings.REDIS_URL,
             decode_responses=True,
             health_check_interval=30,
-            socket_connect_timeout=1,
-            socket_timeout=1,
+            socket_connect_timeout=0.35,
+            socket_timeout=0.35,
         )
     return redis_client
 
@@ -34,27 +47,43 @@ async def close_redis() -> None:
 async def hold_seat(seat_id: str, user_id: str) -> bool:
     """
     Atomically holds a specific seat for a user for 10 minutes (600s).
-    Uses SET key user_id NX EX 600.
-    Returns True if the hold was successfully acquired, False if already held.
+    Returns True if acquired, False if unavailable or Redis offline.
     """
-    client = get_redis()
-    key = f"seat:hold:{seat_id}"
-    acquired = await client.set(key, str(user_id), nx=True, ex=600)
-    return bool(acquired)
+    if not is_redis_available():
+        return False
+    try:
+        client = get_redis()
+        key = f"seat:hold:{seat_id}"
+        acquired = await client.set(key, str(user_id), nx=True, ex=600)
+        return bool(acquired)
+    except Exception:
+        mark_redis_unavailable()
+        return False
 
 
 async def release_seat(seat_id: str) -> None:
-    """Releases a seat hold key from Redis."""
-    client = get_redis()
-    key = f"seat:hold:{seat_id}"
-    await client.delete(key)
+    """Releases a seat hold key from Redis (no-op if Redis is offline)."""
+    if not is_redis_available():
+        return
+    try:
+        client = get_redis()
+        key = f"seat:hold:{seat_id}"
+        await client.delete(key)
+    except Exception:
+        mark_redis_unavailable()
 
 
 async def get_seat_holder(seat_id: str) -> Optional[str]:
     """Retrieves the user ID currently holding a seat, if any."""
-    client = get_redis()
-    key = f"seat:hold:{seat_id}"
-    return await client.get(key)
+    if not is_redis_available():
+        return None
+    try:
+        client = get_redis()
+        key = f"seat:hold:{seat_id}"
+        return await client.get(key)
+    except Exception:
+        mark_redis_unavailable()
+        return None
 
 
 # Atomic Lua script for GA tier capacity decrement with floor check
@@ -83,15 +112,20 @@ async def hold_ga_tier(tier_id: str, user_id: str, quantity: int) -> bool:
     ensuring it does not drop below zero.
     Returns True if successfully held, False otherwise.
     """
-    client = get_redis()
-    key = f"tier:capacity:{tier_id}"
-    result = await client.eval(HOLD_GA_LUA_SCRIPT, 1, key, quantity)
-    if result == 1:
-        # Also store user hold info for reference/expiration (10 mins)
-        user_hold_key = f"tier:hold:{tier_id}:{user_id}"
-        await client.set(user_hold_key, str(quantity), ex=600)
-        return True
-    return False
+    if not is_redis_available():
+        return False
+    try:
+        client = get_redis()
+        key = f"tier:capacity:{tier_id}"
+        result = await client.eval(HOLD_GA_LUA_SCRIPT, 1, key, quantity)
+        if result == 1:
+            user_hold_key = f"tier:hold:{tier_id}:{user_id}"
+            await client.set(user_hold_key, str(quantity), ex=600)
+            return True
+        return False
+    except Exception:
+        mark_redis_unavailable()
+        return False
 
 
 async def publish_event(event_id: str, message: Dict[str, Any]) -> None:
@@ -99,6 +133,11 @@ async def publish_event(event_id: str, message: Dict[str, Any]) -> None:
     Publishes a real-time event message to the event's Redis pub/sub channel.
     Channel name: ws:event:{event_id}
     """
-    client = get_redis()
-    channel = f"ws:event:{event_id}"
-    await client.publish(channel, json.dumps(message))
+    if not is_redis_available():
+        return
+    try:
+        client = get_redis()
+        channel = f"ws:event:{event_id}"
+        await client.publish(channel, json.dumps(message))
+    except Exception:
+        mark_redis_unavailable()

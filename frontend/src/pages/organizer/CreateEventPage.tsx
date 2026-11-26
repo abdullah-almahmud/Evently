@@ -386,7 +386,7 @@ export function CreateEventPage() {
                     onChange={(e) => {
                       const checked = e.target.checked
                       setIsSeated(checked)
-                      if (!checked) setSeatHoldEnabled(false)
+                      setSeatHoldEnabled(checked)
                     }}
                     className="h-4 w-4 mt-0.5 rounded border-input text-primary focus:ring-primary"
                   />
