@@ -7,7 +7,7 @@ from sqlalchemy.orm import selectinload
 from app.core.database import get_db
 from app.core.deps import get_current_active_user
 from app.models import Event, Ticket, User, UserRole
-from app.schemas.ticket import TicketEventSummary, TicketResponse, TicketTierSummary
+from app.schemas.ticket import TicketEventSummary, TicketResponse, TicketSeatSummary, TicketTierSummary
 
 router = APIRouter()
 
@@ -33,6 +33,7 @@ async def get_my_tickets(
         .options(
             selectinload(Ticket.event).selectinload(Event.venue),
             selectinload(Ticket.tier),
+            selectinload(Ticket.seat),
         )
         .order_by(Ticket.created_at.desc())
     )
@@ -47,6 +48,7 @@ async def get_my_tickets(
                 tier_id=ticket.tier_id,
                 user_id=ticket.user_id,
                 seat_id=ticket.seat_id,
+                seat=TicketSeatSummary.model_validate(ticket.seat) if ticket.seat else None,
                 qr_code=ticket.qr_code,
                 status=ticket.status,
                 checked_in_at=ticket.checked_in_at,

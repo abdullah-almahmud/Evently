@@ -11,6 +11,7 @@ class BookingCreateItem(BaseModel):
     """Single tier+quantity item in a booking creation request."""
     tier_id: UUID
     quantity: int
+    seat_id: Optional[UUID] = None  # Required for seated events (1 seat per item)
 
 
 class BookingCreate(BaseModel):

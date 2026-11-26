@@ -28,6 +28,7 @@ import type {
   CheckInTicketItem,
   AdminOverview,
   UserRole,
+  EventSeatsResponse,
 } from '@/types'
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1'
@@ -262,6 +263,17 @@ export const eventsApi = {
 
   deleteTier: async (eventId: string, tierId: string): Promise<void> => {
     await api.delete(`/events/${eventId}/tiers/${tierId}`)
+  },
+
+  // Seats layout & generation
+  getSeats: async (eventId: string): Promise<EventSeatsResponse> => {
+    const res = await api.get<EventSeatsResponse>(`/events/${eventId}/seats`)
+    return res.data
+  },
+
+  generateSeats: async (eventId: string): Promise<EventSeatsResponse> => {
+    const res = await api.post<EventSeatsResponse>(`/events/${eventId}/seats/generate`)
+    return res.data
   },
 }
 

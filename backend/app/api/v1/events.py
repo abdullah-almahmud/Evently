@@ -1,5 +1,6 @@
 import logging
 import math
+import string
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Optional
@@ -12,16 +13,21 @@ from app.core.database import get_db
 from app.core.deps import get_current_active_user, get_current_organizer, get_current_user, oauth2_scheme
 from app.core.security import decode_token
 from app.models import (
+    Booking,
     BookingItem,
+    BookingStatus,
     Event,
     EventCategory,
     EventStaff,
     EventStatus,
+    LayoutType,
+    Seat,
     StaffRole,
     TicketTier,
     User,
     UserRole,
     Venue,
+    VenueSection,
     VolunteerApplication,
     VolunteerApplicationStatus,
 )
@@ -34,6 +40,7 @@ from app.schemas.event import (
     TicketTierResponse,
     TicketTierUpdate,
 )
+from app.schemas.seat import EventSeatsResponse, SeatResponse, SeatSectionGroup
 from app.schemas.staff import (
     StaffResponse,
     VolunteerApplicationCreate,
@@ -370,6 +377,38 @@ async def publish_event(
         )
 
     event.status = EventStatus.PUBLISHED
+
+    # If seated event and no seats generated yet, auto-generate from venue sections
+    if event.is_seated and event.venue_id:
+        seat_count_res = await db.execute(
+            select(func.count(Seat.id)).where(Seat.event_id == event.id)
+        )
+        if seat_count_res.scalar_one() == 0:
+            venue_res = await db.execute(
+                select(Venue).where(Venue.id == event.venue_id).options(selectinload(Venue.sections))
+            )
+            venue = venue_res.scalar_one_or_none()
+            if venue and venue.sections:
+                tiers_res = await db.execute(
+                    select(TicketTier)
+                    .where(TicketTier.event_id == event.id, TicketTier.is_active.is_(True))
+                    .order_by(TicketTier.price.asc())
+                )
+                tiers = tiers_res.scalars().all()
+                sections = sorted(venue.sections, key=lambda s: s.name)
+                for idx, section in enumerate(sections):
+                    tier = tiers[idx] if idx < len(tiers) else (tiers[-1] if tiers else None)
+                    for row_idx in range(section.rows):
+                        for seat_num in range(1, section.seats_per_row + 1):
+                            seat = Seat(
+                                section_id=section.id,
+                                event_id=event.id,
+                                tier_id=tier.id if tier else None,
+                                row_label=_row_label(row_idx),
+                                seat_number=seat_num,
+                            )
+                            db.add(seat)
+
     await db.commit()
     await db.refresh(event)
     return format_event_response(event)
@@ -759,3 +798,205 @@ async def remove_event_staff(
     await db.delete(staff)
     await db.commit()
     return {"message": "Staff assignment removed successfully"}
+
+
+# ─── Seat Map Endpoints ────────────────────────────────────────────────────────
+
+def _row_label(index: int) -> str:
+    """Convert 0-based row index to alphabetic label (0→A, 25→Z, 26→AA, …)."""
+    result = ""
+    n = index
+    while True:
+        result = string.ascii_uppercase[n % 26] + result
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return result
+
+
+@router.post("/{event_id}/seats/generate", response_model=EventSeatsResponse, status_code=status.HTTP_201_CREATED)
+async def generate_seats_for_event(
+    event_id: UUID,
+    current_user: User = Depends(get_current_organizer),
+    db: AsyncSession = Depends(get_db),
+) -> EventSeatsResponse:
+    """
+    Organizer: auto-generate Seat rows for a seated event from its venue sections.
+    Idempotent — clears existing seats first if re-generated.
+    Each section's rows × seats_per_row produces labelled Seat records (Row A–Z, seat 1–N).
+    """
+    query = (
+        select(Event)
+        .where(Event.id == event_id)
+        .options(selectinload(Event.venue).selectinload(Venue.sections))
+    )
+    res = await db.execute(query)
+    event = res.scalar_one_or_none()
+
+    if not event:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+    if event.organizer_id != current_user.id and current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    if not event.is_seated:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot generate seats for a non-seated event")
+    if not event.venue or not event.venue.sections:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Event's venue has no sections. Add sections to the venue first.",
+        )
+
+    # Remove existing seats for this event (safe re-generation)
+    existing_res = await db.execute(select(Seat).where(Seat.event_id == event_id))
+    for existing_seat in existing_res.scalars().all():
+        await db.delete(existing_seat)
+    await db.flush()
+
+    # Find tiers to map sections → tiers (best-effort: sort tiers by price, sections by name)
+    tiers_res = await db.execute(
+        select(TicketTier)
+        .where(TicketTier.event_id == event_id, TicketTier.is_active.is_(True))
+        .order_by(TicketTier.price.asc())
+    )
+    tiers = tiers_res.scalars().all()
+
+    sections = sorted(event.venue.sections, key=lambda s: s.name)
+    section_groups = []
+
+    for idx, section in enumerate(sections):
+        tier = tiers[idx] if idx < len(tiers) else (tiers[-1] if tiers else None)
+        new_seats = []
+
+        for row_idx in range(section.rows):
+            for seat_num in range(1, section.seats_per_row + 1):
+                seat = Seat(
+                    section_id=section.id,
+                    event_id=event_id,
+                    tier_id=tier.id if tier else None,
+                    row_label=_row_label(row_idx),
+                    seat_number=seat_num,
+                )
+                db.add(seat)
+                new_seats.append(seat)
+
+        await db.flush()
+        section_groups.append(SeatSectionGroup(
+            section_id=section.id,
+            section_name=section.name,
+            rows=section.rows,
+            seats_per_row=section.seats_per_row,
+            tier_id=tier.id if tier else None,
+            seats=[SeatResponse(
+                id=s.id,
+                section_id=s.section_id,
+                row_label=s.row_label,
+                seat_number=s.seat_number,
+                status="AVAILABLE",
+            ) for s in new_seats],
+        ))
+
+    await db.commit()
+
+    return EventSeatsResponse(
+        event_id=event_id,
+        is_seated=True,
+        sections=section_groups,
+    )
+
+
+@router.get("/{event_id}/seats", response_model=EventSeatsResponse)
+async def get_event_seats(
+    event_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> EventSeatsResponse:
+    """
+    Public: returns the full seat map for a seated event.
+    Seat status is computed from active BookingItems (RESERVED) vs database rows (AVAILABLE).
+    Redis holds are not surfaced here for simplicity; a seat disappears from AVAILABLE once booked.
+    """
+    query = (
+        select(Event)
+        .where(Event.id == event_id)
+        .options(selectinload(Event.venue).selectinload(Venue.sections))
+    )
+    res = await db.execute(query)
+    event = res.scalar_one_or_none()
+
+    if not event:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
+
+    if not event.is_seated:
+        return EventSeatsResponse(event_id=event_id, is_seated=False, sections=[])
+
+    # Fetch all seats for this event
+    seats_res = await db.execute(
+        select(Seat).where(Seat.event_id == event_id).order_by(Seat.row_label, Seat.seat_number)
+    )
+    all_seats = seats_res.scalars().all()
+
+    # Determine which seat_ids are reserved (confirmed or pending bookings)
+    reserved_res = await db.execute(
+        select(BookingItem.seat_id)
+        .join(Booking, Booking.id == BookingItem.booking_id)
+        .where(
+            BookingItem.seat_id.is_not(None),
+            BookingItem.booking_id.in_(
+                select(Booking.id).where(
+                    Booking.event_id == event_id,
+                    Booking.status.in_([BookingStatus.CONFIRMED, BookingStatus.PENDING]),
+                )
+            ),
+        )
+    )
+    reserved_seat_ids = {row[0] for row in reserved_res.fetchall()}
+
+    # Group seats by section
+    section_map: dict = {}
+    for seat in all_seats:
+        sid = str(seat.section_id)
+        if sid not in section_map:
+            section_map[sid] = []
+        section_map[sid].append(seat)
+
+    # Fetch sections for metadata
+    sections_res = await db.execute(
+        select(VenueSection).where(VenueSection.venue_id == event.venue_id)
+    )
+    sections_by_id = {str(s.id): s for s in sections_res.scalars().all()}
+
+    # Build section groups from tiers
+    tiers_res = await db.execute(
+        select(TicketTier).where(TicketTier.event_id == event_id, TicketTier.is_active.is_(True))
+    )
+    tiers_by_id = {str(t.id): t for t in tiers_res.scalars().all()}
+
+    section_groups = []
+    for sid, seats in section_map.items():
+        section = sections_by_id.get(sid)
+        # Determine tier from first seat's tier_id
+        tier_id = str(seats[0].tier_id) if seats and seats[0].tier_id else None
+
+        seat_responses = []
+        for s in sorted(seats, key=lambda x: (x.row_label, x.seat_number)):
+            seat_status = "RESERVED" if s.id in reserved_seat_ids else "AVAILABLE"
+            seat_responses.append(SeatResponse(
+                id=s.id,
+                section_id=s.section_id,
+                row_label=s.row_label,
+                seat_number=s.seat_number,
+                status=seat_status,
+            ))
+
+        section_groups.append(SeatSectionGroup(
+            section_id=UUID(sid),
+            section_name=section.name if section else sid[:8],
+            rows=section.rows if section else 0,
+            seats_per_row=section.seats_per_row if section else 0,
+            tier_id=UUID(tier_id) if tier_id else None,
+            seats=seat_responses,
+        ))
+
+    return EventSeatsResponse(
+        event_id=event_id,
+        is_seated=True,
+        sections=sorted(section_groups, key=lambda g: g.section_name),
+    )

@@ -111,12 +111,19 @@ export interface OrganizerRequest {
   user?: User
 }
 
+export interface TicketSeatSummary {
+  id: string
+  row_label: string
+  seat_number: number
+}
+
 export interface Ticket {
   id: string
   event_id: string
   tier_id: string
   user_id: string
   seat_id?: string | null
+  seat?: TicketSeatSummary | null
   qr_code: string
   status: TicketStatus
   checked_in_at?: string | null
@@ -149,6 +156,30 @@ export interface Booking {
 export interface BookingCreateItem {
   tier_id: string
   quantity: number
+  seat_id?: string | null
+}
+
+export interface Seat {
+  id: string
+  section_id: string
+  row_label: string
+  seat_number: number
+  status: 'AVAILABLE' | 'RESERVED' | 'HELD'
+}
+
+export interface SeatSectionGroup {
+  section_id: string
+  section_name: string
+  rows: number
+  seats_per_row: number
+  tier_id?: string | null
+  seats: Seat[]
+}
+
+export interface EventSeatsResponse {
+  event_id: string
+  is_seated: boolean
+  sections: SeatSectionGroup[]
 }
 
 export interface CreateBookingRequest {

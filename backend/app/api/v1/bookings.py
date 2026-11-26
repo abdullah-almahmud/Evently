@@ -17,6 +17,7 @@ from app.models import (
     BookingStatus,
     Event,
     EventStatus,
+    Seat,
     Ticket,
     TicketStatus,
     TicketTier,
@@ -24,7 +25,7 @@ from app.models import (
     UserRole,
 )
 from app.schemas.booking import BookingCreate, BookingResponse, BookingItemResponse
-from app.schemas.ticket import TicketEventSummary, TicketResponse, TicketTierSummary
+from app.schemas.ticket import TicketEventSummary, TicketResponse, TicketSeatSummary, TicketTierSummary
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ def _booking_load_options():
     return (
         selectinload(Booking.event).selectinload(Event.venue),
         selectinload(Booking.items).selectinload(BookingItem.tier),
-        selectinload(Booking.items).selectinload(BookingItem.tickets),
+        selectinload(Booking.items).selectinload(BookingItem.tickets).selectinload(Ticket.seat),
     )
 
 
@@ -54,12 +55,14 @@ def _build_booking_response(booking: Booking) -> BookingResponse:
             tier=tier_summary,
         ))
         for ticket in (item.tickets or []):
+            seat_summary = TicketSeatSummary.model_validate(ticket.seat) if ticket.seat else None
             all_tickets.append(TicketResponse(
                 id=ticket.id,
                 event_id=ticket.event_id,
                 tier_id=ticket.tier_id,
                 user_id=ticket.user_id,
                 seat_id=ticket.seat_id,
+                seat=seat_summary,
                 qr_code=ticket.qr_code,
                 status=ticket.status,
                 checked_in_at=ticket.checked_in_at,
@@ -100,6 +103,7 @@ async def _generate_tickets_for_booking(booking: Booking, db: AsyncSession) -> N
                 user_id=booking.user_id,
                 event_id=booking.event_id,
                 tier_id=item.tier_id,
+                seat_id=item.seat_id,  # propagate seat assignment
                 qr_code=qr,
                 status=TicketStatus.ACTIVE,
             )
@@ -137,7 +141,7 @@ async def create_booking(
 
     total_amount = Decimal("0.00")
     has_paid = False
-    tier_items = []  # list of (tier, quantity)
+    tier_items = []  # list of (tier, quantity, seat_id)
 
     for req_item in data.items:
         if req_item.quantity <= 0:
@@ -184,7 +188,49 @@ async def create_booking(
                 detail=f"Not enough tickets available for tier '{tier.name}'. Available: {tier.available_quantity}",
             )
 
-        tier_items.append((tier, req_item.quantity))
+        # ── Seat validation for seated events ──────────────────────────────────
+        resolved_seat_id = None
+        if event.is_seated:
+            if not req_item.seat_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"This is a seated event. You must select a specific seat for tier '{tier.name}'.",
+                )
+            # Validate seat exists and belongs to this event
+            seat_res = await db.execute(
+                select(Seat).where(Seat.id == req_item.seat_id, Seat.event_id == data.event_id)
+            )
+            seat = seat_res.scalar_one_or_none()
+            if not seat:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Seat not found or does not belong to this event",
+                )
+            # Check seat isn't already booked (atomic check using a subquery)
+            already_booked_res = await db.execute(
+                select(func.count(BookingItem.id))
+                .join(Booking, Booking.id == BookingItem.booking_id)
+                .where(
+                    BookingItem.seat_id == req_item.seat_id,
+                    Booking.event_id == data.event_id,
+                    Booking.status.in_([BookingStatus.CONFIRMED, BookingStatus.PENDING]),
+                )
+            )
+            if already_booked_res.scalar_one() > 0:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Seat {seat.row_label}{seat.seat_number} is already taken. Please choose another seat.",
+                )
+            # Seated bookings are always qty=1 per item (one seat = one ticket)
+            if req_item.quantity != 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="For seated events, quantity must be 1 per seat selection",
+                )
+            resolved_seat_id = req_item.seat_id
+        # ───────────────────────────────────────────────────────────────────────
+
+        tier_items.append((tier, req_item.quantity, resolved_seat_id))
         total_amount += tier.price * req_item.quantity
         if tier.price > 0:
             has_paid = True
@@ -204,7 +250,7 @@ async def create_booking(
 
     # Deduct quantities and create booking items
     all_tiers_zero = True
-    for tier, qty in tier_items:
+    for tier, qty, seat_id in tier_items:
         tier.available_quantity -= qty
         if tier.available_quantity > 0:
             all_tiers_zero = False
@@ -214,6 +260,7 @@ async def create_booking(
             tier_id=tier.id,
             quantity=qty,
             unit_price=tier.price,
+            seat_id=seat_id,
         )
         db.add(item)
 

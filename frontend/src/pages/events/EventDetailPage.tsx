@@ -18,9 +18,12 @@ import {
   Loader2,
   AlertCircle,
   ExternalLink,
+  Armchair,
+  RefreshCw,
 } from 'lucide-react'
-import { Event, TicketTier, VolunteerApplication, Booking } from '@/types'
+import { Event, TicketTier, VolunteerApplication, Booking, Seat, EventSeatsResponse } from '@/types'
 import { eventsApi, bookingsApi, volunteerApi } from '@/lib/api'
+import { SeatMap } from '@/components/events/SeatMap'
 import { formatDateRange, formatCurrency } from '@/lib/utils'
 import { useAuth } from '@/hooks/useAuth'
 import { Button } from '@/components/ui/button'
@@ -50,6 +53,9 @@ export function EventDetailPage() {
 
   // Booking state
   const [selectedQuantities, setSelectedQuantities] = useState<Record<string, number>>({})
+  const [selectedSeats, setSelectedSeats] = useState<Seat[]>([])
+  const [eventSeats, setEventSeats] = useState<EventSeatsResponse | null>(null)
+  const [isGeneratingSeats, setIsGeneratingSeats] = useState(false)
   const [isBooking, setIsBooking] = useState(false)
   const [confirmedBooking, setConfirmedBooking] = useState<Booking | null>(null)
   const [bookingSuccessModalOpen, setBookingSuccessModalOpen] = useState(false)
@@ -81,6 +87,16 @@ export function EventDetailPage() {
           setTiers(tiersData || [])
         } catch {
           setTiers([])
+        }
+      }
+
+      // If seated event, load seat layout
+      if (eventData.is_seated) {
+        try {
+          const seatsData = await eventsApi.getSeats(id)
+          setEventSeats(seatsData)
+        } catch (seatErr) {
+          console.error('Failed to load event seats:', seatErr)
         }
       }
 
@@ -119,12 +135,53 @@ export function EventDetailPage() {
     })
   }
 
-  const totalTicketsSelected = Object.values(selectedQuantities).reduce((a, b) => a + b, 0)
+  const handleSeatToggle = (seat: Seat) => {
+    setSelectedSeats((prev) => {
+      const exists = prev.some((s) => s.id === seat.id)
+      if (exists) {
+        return prev.filter((s) => s.id !== seat.id)
+      }
+      if (prev.length >= 4) {
+        toast.warning('You can select a maximum of 4 seats per booking.')
+        return prev
+      }
+      return [...prev, seat]
+    })
+  }
 
-  const totalCost = tiers.reduce((sum, tier) => {
-    const qty = selectedQuantities[tier.id] || 0
-    return sum + Number(tier.price) * qty
-  }, 0)
+  const handleGenerateSeats = async () => {
+    if (!id) return
+    try {
+      setIsGeneratingSeats(true)
+      const data = await eventsApi.generateSeats(id)
+      setEventSeats(data)
+      toast.success('Seating layout generated from venue sections!')
+    } catch (err: unknown) {
+      const errorMsg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+        'Failed to generate seats. Ensure the venue has sections configured.'
+      toast.error(errorMsg)
+    } finally {
+      setIsGeneratingSeats(false)
+    }
+  }
+
+  const isSeated = Boolean(event?.is_seated)
+
+  const totalTicketsSelected = isSeated
+    ? selectedSeats.length
+    : Object.values(selectedQuantities).reduce((a, b) => a + b, 0)
+
+  const totalCost = isSeated
+    ? selectedSeats.reduce((sum, seat) => {
+        const sec = eventSeats?.sections.find((s) => s.section_id === seat.section_id)
+        const t = sec?.tier_id ? tiers.find((tier) => tier.id === sec.tier_id) : tiers[0]
+        return sum + Number(t?.price || 0)
+      }, 0)
+    : tiers.reduce((sum, tier) => {
+        const qty = selectedQuantities[tier.id] || 0
+        return sum + Number(tier.price) * qty
+      }, 0)
 
   const handleCreateBooking = async () => {
     if (!isAuthenticated) {
@@ -138,13 +195,31 @@ export function EventDetailPage() {
       return
     }
 
-    const items = Object.entries(selectedQuantities)
-      .filter(([_, qty]) => qty > 0)
-      .map(([tier_id, quantity]) => ({ tier_id, quantity }))
+    let items: Array<{ tier_id: string; quantity: number; seat_id?: string }> = []
 
-    if (items.length === 0) {
-      toast.warning('Please select at least one ticket before proceeding.')
-      return
+    if (isSeated) {
+      if (selectedSeats.length === 0) {
+        toast.warning('Please select at least one seat before proceeding.')
+        return
+      }
+      items = selectedSeats.map((seat) => {
+        const sec = eventSeats?.sections.find((s) => s.section_id === seat.section_id)
+        const tierId = sec?.tier_id || tiers[0]?.id
+        return {
+          tier_id: tierId,
+          quantity: 1,
+          seat_id: seat.id,
+        }
+      })
+    } else {
+      items = Object.entries(selectedQuantities)
+        .filter(([_, qty]) => qty > 0)
+        .map(([tier_id, quantity]) => ({ tier_id, quantity }))
+
+      if (items.length === 0) {
+        toast.warning('Please select at least one ticket before proceeding.')
+        return
+      }
     }
 
     try {
@@ -157,6 +232,7 @@ export function EventDetailPage() {
       setConfirmedBooking(booking)
       setBookingSuccessModalOpen(true)
       setSelectedQuantities({})
+      setSelectedSeats([])
       toast.success('Booking confirmed! Digital tickets issued.')
       // Refresh event details to update available quantities
       fetchDetails()
@@ -342,6 +418,50 @@ export function EventDetailPage() {
             </Card>
           </div>
 
+          {/* Seating Map Card for Seated Events */}
+          {event.is_seated && (
+            <Card className="border-primary/20 shadow-sm">
+              <CardHeader className="pb-3 flex flex-row items-center justify-between">
+                <div>
+                  <CardTitle className="text-lg flex items-center gap-2">
+                    <Armchair className="h-5 w-5 text-primary" />
+                    Interactive Seat Selection
+                  </CardTitle>
+                  <CardDescription className="text-xs">
+                    Choose your exact seats from the venue layout below
+                  </CardDescription>
+                </div>
+                {canManageThisEvent && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleGenerateSeats}
+                    disabled={isGeneratingSeats}
+                    className="gap-1.5 text-xs h-8"
+                  >
+                    {isGeneratingSeats ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-3.5 w-3.5" />
+                    )}
+                    Generate / Reset Seats
+                  </Button>
+                )}
+              </CardHeader>
+              <CardContent>
+                <SeatMap
+                  sections={eventSeats?.sections || []}
+                  tiers={tiers}
+                  selectedSeats={selectedSeats}
+                  onSeatToggle={handleSeatToggle}
+                  maxSelectable={4}
+                  disabled={!canBookThisEvent}
+                />
+              </CardContent>
+            </Card>
+          )}
+
           {/* Volunteer Section (Hidden for Admins and the event's own Organizer) */}
           {canBookThisEvent && (
             <Card className="border-indigo-500/20 bg-indigo-500/5">
@@ -435,16 +555,125 @@ export function EventDetailPage() {
           <Card className="sticky top-24 border-primary/20 shadow-md">
             <CardHeader className="pb-4">
               <CardTitle className="text-lg flex items-center justify-between">
-                <span>Select Tickets</span>
-                <Ticket className="h-5 w-5 text-primary" />
+                <span>{isSeated ? 'Reserved Seats' : 'Select Tickets'}</span>
+                {isSeated ? <Armchair className="h-5 w-5 text-primary" /> : <Ticket className="h-5 w-5 text-primary" />}
               </CardTitle>
               <CardDescription className="text-xs">
-                Select quantities for your desired passes
+                {isSeated
+                  ? 'Select seats from the floor plan to complete booking'
+                  : 'Select quantities for your desired passes'}
               </CardDescription>
             </CardHeader>
 
             <CardContent className="space-y-4">
-              {tiers.length > 0 ? (
+              {isSeated ? (
+                <div className="space-y-4">
+                  {selectedSeats.length > 0 ? (
+                    <div className="space-y-2.5">
+                      <div className="flex items-center justify-between text-xs font-medium">
+                        <span className="text-foreground">Your Selected Seats ({selectedSeats.length}):</span>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 px-1.5 text-[11px] text-muted-foreground hover:text-destructive"
+                          onClick={() => setSelectedSeats([])}
+                        >
+                          Clear all
+                        </Button>
+                      </div>
+
+                      <div className="space-y-1.5 max-h-52 overflow-y-auto pr-0.5">
+                        {selectedSeats.map((seat) => {
+                          const sec = eventSeats?.sections.find((s) => s.section_id === seat.section_id)
+                          const t = sec?.tier_id ? tiers.find((tier) => tier.id === sec.tier_id) : tiers[0]
+                          return (
+                            <div
+                              key={seat.id}
+                              className="flex items-center justify-between text-xs p-2 rounded-lg bg-muted/40 border"
+                            >
+                              <div>
+                                <span className="font-semibold text-foreground">
+                                  Row {seat.row_label}, Seat {seat.seat_number}
+                                </span>
+                                <span className="text-[11px] text-muted-foreground ml-1.5">
+                                  ({sec?.section_name || 'Section'})
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span className="font-bold text-primary">
+                                  {Number(t?.price || 0) === 0 ? 'Free' : formatCurrency(t?.price || 0)}
+                                </span>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-5 w-5 text-muted-foreground hover:text-destructive p-0"
+                                  onClick={() => handleSeatToggle(seat)}
+                                >
+                                  <Minus className="h-3 w-3" />
+                                </Button>
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="rounded-lg border border-dashed p-4 text-center text-xs text-muted-foreground space-y-1">
+                      <Armchair className="mx-auto h-6 w-6 text-muted-foreground/40 mb-1" />
+                      <p className="font-medium text-foreground">No seats selected</p>
+                      <p>Click on green seats in the Interactive Seat Selection map above.</p>
+                    </div>
+                  )}
+
+                  {/* Summary & Booking Button */}
+                  {canBookThisEvent ? (
+                    <div className="pt-3 border-t space-y-3">
+                      <div className="flex items-center justify-between text-sm font-semibold">
+                        <span>Total ({selectedSeats.length} {selectedSeats.length === 1 ? 'seat' : 'seats'}):</span>
+                        <span className="text-base text-primary">
+                          {totalCost === 0 ? 'Free' : formatCurrency(totalCost)}
+                        </span>
+                      </div>
+
+                      <Button
+                        className="w-full font-semibold shadow-sm"
+                        disabled={selectedSeats.length === 0 || isBooking}
+                        onClick={handleCreateBooking}
+                      >
+                        {isBooking ? (
+                          <>
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            Reserving Seats...
+                          </>
+                        ) : totalCost === 0 ? (
+                          `Confirm Free Reservation (${selectedSeats.length})`
+                        ) : (
+                          `Book Seats (${formatCurrency(totalCost)})`
+                        )}
+                      </Button>
+
+                      <p className="text-[11px] text-muted-foreground text-center">
+                        Instant digital QR pass generation with assigned seats.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="pt-3 border-t text-xs text-muted-foreground text-center space-y-2">
+                      <p>
+                        {isAdmin
+                          ? 'Administrators do not book personal attendee tickets.'
+                          : 'You are the organizer of this event.'}
+                      </p>
+                      <Button variant="outline" size="sm" asChild className="w-full">
+                        <Link to={`/organizer/events/${event.id}/analytics`}>
+                          View Event Analytics & Orders
+                        </Link>
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              ) : tiers.length > 0 ? (
                 <div className="space-y-3">
                   {tiers.map((tier) => {
                     const isAvailable = tier.available_quantity > 0 && tier.is_active

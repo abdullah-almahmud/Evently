@@ -1,6 +1,6 @@
 import { useState, useEffect, FormEvent } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { ChevronLeft, Plus, Trash2, Loader2, Pencil, Users, UserCheck, BarChart3 } from 'lucide-react'
+import { ChevronLeft, Plus, Trash2, Loader2, Pencil, Users, UserCheck, BarChart3, ExternalLink } from 'lucide-react'
 import { EventCategory, Venue, TicketTier } from '@/types'
 import { eventsApi, venuesApi } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -291,6 +291,12 @@ export function EditEventPage() {
             <Link to={`/organizer/events/${id}/analytics`}>
               <BarChart3 className="h-4 w-4 text-indigo-600" />
               Analytics
+            </Link>
+          </Button>
+          <Button variant="outline" size="sm" asChild className="gap-1.5">
+            <Link to={`/events/${id}`}>
+              <ExternalLink className="h-4 w-4" />
+              Event Page
             </Link>
           </Button>
         </div>

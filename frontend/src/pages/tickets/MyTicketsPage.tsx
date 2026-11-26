@@ -10,6 +10,7 @@ import {
   ShoppingBag,
   CheckCircle2,
   XCircle,
+  Armchair,
 } from 'lucide-react'
 import QRCode from 'react-qr-code'
 import { Ticket, TicketStatus } from '@/types'
@@ -161,6 +162,13 @@ export function MyTicketsPage() {
                         {ticket.tier?.name || 'General Admission'}
                       </span>
                     </div>
+
+                    {ticket.seat && (
+                      <div className="flex items-center gap-1.5 font-semibold text-primary">
+                        <Armchair className="h-3.5 w-3.5" />
+                        <span>Seat: Row {ticket.seat.row_label}-{ticket.seat.seat_number}</span>
+                      </div>
+                    )}
                   </div>
 
                   {ticket.checked_in_at && (
@@ -212,6 +220,12 @@ export function MyTicketsPage() {
                 <p className="text-xs text-primary font-medium">
                   {selectedTicket.tier?.name || 'Ticket Pass'}
                 </p>
+                {selectedTicket.seat && (
+                  <Badge variant="outline" className="font-semibold gap-1 text-xs py-0.5">
+                    <Armchair className="h-3 w-3 text-primary" />
+                    Row {selectedTicket.seat.row_label}, Seat {selectedTicket.seat.seat_number}
+                  </Badge>
+                )}
                 <p className="text-xs text-muted-foreground font-mono">
                   Ticket ID: {selectedTicket.id.slice(0, 13)}...
                 </p>

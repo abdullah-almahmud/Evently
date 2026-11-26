@@ -36,6 +36,15 @@ class TicketTierSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class TicketSeatSummary(BaseModel):
+    """Minimal seat info nested on tickets."""
+    id: UUID
+    row_label: str
+    seat_number: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class TicketResponse(BaseModel):
     """Details of an issued ticket."""
     id: UUID
@@ -43,6 +52,7 @@ class TicketResponse(BaseModel):
     tier_id: UUID
     user_id: UUID
     seat_id: Optional[UUID] = None
+    seat: Optional[TicketSeatSummary] = None
     qr_code: str
     status: TicketStatus
     checked_in_at: Optional[datetime] = None
